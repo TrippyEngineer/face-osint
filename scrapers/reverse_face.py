@@ -1,0 +1,679 @@
+import base64
+import json
+import logging
+import re
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
+import cv2
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+
+import config
+
+logger = logging.getLogger(__name__)
+
+FACE_POSSIBLE  = getattr(config, "FACE_POSSIBLE",  0.50)
+MAX_CANDIDATES = 25   # 25 × ~1s/face ≈ 20s verify; keeps total under 90s timeout
+VERIFY_WORKERS = 6
+
+_SOCIAL = {
+    "linkedin.com": "LinkedIn", "github.com": "GitHub", "gitlab.com": "GitLab",
+    "twitter.com": "Twitter", "x.com": "Twitter", "instagram.com": "Instagram",
+    "facebook.com": "Facebook", "reddit.com": "Reddit", "medium.com": "Medium",
+    "researchgate.net": "ResearchGate", "orcid.org": "ORCID",
+    "behance.net": "Behance", "dribbble.com": "Dribbble", "dev.to": "Dev.to",
+    "stackoverflow.com": "Stack Overflow", "youtube.com": "YouTube",
+    "tiktok.com": "TikTok", "pinterest.com": "Pinterest", "vk.com": "VK",
+    "hackerrank.com": "HackerRank", "kaggle.com": "Kaggle",
+    "replit.com": "Replit", "twitch.tv": "Twitch", "flickr.com": "Flickr",
+    "t.me": "Telegram", "keybase.io": "Keybase",
+}
+
+def _platform(url: str) -> str:
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+        for d, n in _SOCIAL.items():
+            if d in host:
+                return n
+    except Exception:
+        pass
+    return "Web"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  IMAGE HOSTING
+# ══════════════════════════════════════════════════════════════════════════
+def _host_image(img_bytes: bytes) -> Optional[str]:
+    """Upload face crop to a public URL. SerpApi needs this."""
+
+    # 1. imgbb — API key set in .env
+    key = getattr(config, "IMGBB_API_KEY", "")
+    if key:
+        try:
+            r = requests.post(
+                "https://api.imgbb.com/1/upload",
+                data={"key": key, "image": base64.b64encode(img_bytes).decode(),
+                      "expiration": 600},
+                timeout=12,
+            )
+            url = r.json().get("data", {}).get("url")
+            if url:
+                logger.info(f"imgbb OK → {url[:60]}")
+                return url
+        except Exception as e:
+            logger.debug(f"imgbb: {e}")
+
+    # 2. catbox.moe — no key needed, very reliable
+    try:
+        r = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload", "userhash": ""},
+            files={"fileToUpload": ("face.jpg", img_bytes, "image/jpeg")},
+            timeout=15,
+        )
+        if r.ok and r.text.strip().startswith("https://"):
+            url = r.text.strip()
+            logger.info(f"catbox.moe OK → {url}")
+            return url
+    except Exception as e:
+        logger.debug(f"catbox: {e}")
+
+    # 3. litterbox — no key, 1hr TTL
+    try:
+        r = requests.post(
+            "https://litterbox.catbox.moe/resources/internals/api.php",
+            data={"reqtype": "fileupload", "time": "1h"},
+            files={"fileToUpload": ("face.jpg", img_bytes, "image/jpeg")},
+            timeout=15,
+        )
+        if r.ok and r.text.strip().startswith("https://"):
+            url = r.text.strip()
+            logger.info(f"litterbox OK → {url}")
+            return url
+    except Exception as e:
+        logger.debug(f"litterbox: {e}")
+
+    logger.warning("All image hosting failed — SerpApi engines will be skipped")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 1 — SerpApi Google Lens
+# ══════════════════════════════════════════════════════════════════════════
+def _serpapi_lens(public_url: Optional[str]) -> tuple[list[dict], list[str]]:
+    """
+    Google Lens via SerpApi.
+    Docs: https://serpapi.com/google-lens-api
+    Returns visual matches + entity panel (person name if known to Google).
+    """
+    key = getattr(config, "SERPAPI_KEY", "")
+    if not key:
+        logger.info("SerpApi: no SERPAPI_KEY")
+        return [], []
+    if not public_url:
+        logger.info("SerpApi Lens: no public URL (image hosting failed)")
+        return [], []
+
+    matches, names, seen = [], [], set()
+
+    for search_type in ["visual_matches", "exact_matches"]:
+        try:
+            r = requests.get(
+                "https://serpapi.com/search",
+                params={
+                    "api_key": key,
+                    "engine":  "google_lens",
+                    "url":     public_url,
+                    "type":    search_type,
+                    "hl":      "en",
+                },
+                timeout=25,
+            )
+            if not r.ok:
+                logger.warning(f"SerpApi Lens {search_type}: HTTP {r.status_code}")
+                continue
+            data = r.json()
+
+            for item in data.get("visual_matches", []):
+                url = item.get("link", "")
+                if url and url not in seen:
+                    seen.add(url)
+                    matches.append({
+                        "url":       url,
+                        "title":     item.get("title", ""),
+                        "photo_url": item.get("thumbnail") or None,
+                        "platform":  _platform(url),
+                        "source":    f"serpapi_lens_{search_type}",
+                    })
+
+            # Knowledge graph / entity panel — Lens sometimes identifies the person directly
+            for kg in (data.get("knowledge_graph") or []):
+                nm  = kg.get("title", "")
+                url = kg.get("link", "")
+                if nm and len(nm.split()) >= 2:
+                    names.append(nm)
+                    logger.info(f"SerpApi Lens entity: '{nm}'")
+                if url and url not in seen:
+                    seen.add(url)
+                    matches.append({
+                        "url":      url,
+                        "title":    nm,
+                        "platform": _platform(url),
+                        "source":   "serpapi_lens_entity",
+                    })
+
+            time.sleep(0.2)  # avoid hammering quota
+        except Exception as e:
+            logger.debug(f"SerpApi Lens {search_type}: {e}")
+
+    logger.info(f"SerpApi Google Lens: {len(matches)} candidates, names={names}")
+    return matches, names
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 2 — SerpApi Yandex Reverse Image
+# ══════════════════════════════════════════════════════════════════════════
+def _serpapi_yandex(public_url: Optional[str]) -> tuple[list[dict], list[str]]:
+    """
+    Yandex Images via SerpApi.
+    Docs: https://serpapi.com/yandex-search-api (images)
+    Best for Indian/Eastern European/South Asian content.
+    """
+    key = getattr(config, "SERPAPI_KEY", "")
+    if not key or not public_url:
+        return [], []
+
+    matches, names, seen = [], [], set()
+    try:
+        r = requests.get(
+            "https://serpapi.com/search",
+            params={
+                "api_key": key,
+                "engine":  "yandex_images",
+                "url":     public_url,
+            },
+            timeout=25,
+        )
+        if not r.ok:
+            logger.warning(f"SerpApi Yandex: HTTP {r.status_code}")
+            return [], []
+        data = r.json()
+
+        for item in data.get("image_results", []):
+            url = item.get("link", "")
+            if url and url not in seen:
+                seen.add(url)
+                thumb = item.get("thumbnail", "")
+                if isinstance(thumb, dict):
+                    thumb = thumb.get("src", "")
+                matches.append({
+                    "url":       url,
+                    "title":     item.get("title", ""),
+                    "photo_url": thumb or None,
+                    "platform":  _platform(url),
+                    "source":    "serpapi_yandex",
+                })
+
+        kg = data.get("knowledge_graph", {})
+        if isinstance(kg, dict):
+            nm = kg.get("title", "") or kg.get("name", "")
+            if nm and len(nm.split()) >= 2:
+                names.append(nm)
+                logger.info(f"SerpApi Yandex entity: '{nm}'")
+
+        logger.info(f"SerpApi Yandex: {len(matches)} candidates, names={names}")
+        return matches, names
+    except Exception as e:
+        logger.warning(f"SerpApi Yandex: {e}")
+        return [], []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 3 — Yandex CBir direct upload (no key, corrected 2025 endpoint)
+# ══════════════════════════════════════════════════════════════════════════
+_YA_HDR = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://yandex.com/images/",
+}
+
+def _yandex_direct(img_bytes: bytes) -> tuple[list[dict], list[str]]:
+    """Direct POST to Yandex CBIR — no key needed, no hosting needed."""
+    for block in [
+        '{"blocks":[{"block":"cbir-uploader__get-cbir-id"}]}',
+        '{"blocks":[{"block":"b-page_type_search-by-image__link"}]}',
+    ]:
+        try:
+            r = requests.post(
+                "https://yandex.com/images/search",
+                params={"rpt": "imageview", "format": "json", "request": block},
+                files={"upfile": ("blob", img_bytes, "image/jpeg")},
+                headers=_YA_HDR,
+                timeout=20,
+            )
+            if not r.ok:
+                continue
+            blks = r.json().get("blocks", [])
+            if not blks:
+                continue
+            qs = blks[0].get("params", {}).get("url", "")
+            if not qs:
+                continue
+
+            s  = requests.Session()
+            s.headers.update(_YA_HDR)
+            r2 = s.get(f"https://yandex.com/images/search?{qs}", timeout=20)
+            if not r2.ok:
+                continue
+
+            matches, names = _parse_yandex_html(r2.text)
+            logger.info(f"Yandex direct: {len(matches)} candidates, names={names}")
+            return matches, names
+        except Exception as e:
+            logger.debug(f"Yandex direct block attempt: {e}")
+
+    logger.warning("Yandex direct upload: both block names failed")
+    return [], []
+
+def _parse_yandex_html(html: str) -> tuple[list[dict], list[str]]:
+    matches, names, seen = [], [], set()
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    for item in soup.select(".CbirSites-Item, .cbir-section__sites-item"):
+        a = item.select_one("a[href]")
+        if not a:
+            continue
+        href = a.get("href", "")
+        if href.startswith("http") and "yandex" not in href and href not in seen:
+            seen.add(href)
+            img_t = item.select_one("img")
+            thumb = img_t.get("src", "") if img_t else ""
+            matches.append({
+                "url":       href,
+                "title":     a.get_text(strip=True)[:120],
+                "photo_url": thumb if thumb.startswith("http") else None,
+                "platform":  _platform(href),
+                "source":    "yandex_direct",
+            })
+
+    for script in soup.find_all("script"):
+        txt = script.string or ""
+        if not txt or "cbir" not in txt:
+            continue
+        for m in re.finditer(r'"(?:url|pageUrl)"\s*:\s*"(https?://[^"]{10,})"', txt):
+            href = m.group(1).replace("\\u002F", "/")
+            if "yandex" not in href and href not in seen:
+                seen.add(href)
+                matches.append({"url": href, "title": "",
+                                 "platform": _platform(href), "source": "yandex_json"})
+
+    for el in soup.select(".CbirObjectResponse-Title, .CbirPeople-Title, .entity-title"):
+        t = el.get_text(strip=True)
+        if t and 3 < len(t) < 80:
+            names.append(t)
+
+    return matches, names
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 4 — Google CSE image + social search
+# ══════════════════════════════════════════════════════════════════════════
+def _google_cse(name_hint: str, public_url: Optional[str]) -> list[dict]:
+    key = getattr(config, "GOOGLE_CSE_KEY", "")
+    cx  = getattr(config, "GOOGLE_CSE_ID",  "")
+    if not key or not cx:
+        return []
+
+    matches, seen = [], set()
+
+    # Image search by URL
+    if public_url:
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": key, "cx": cx, "searchType": "image",
+                        "imgType": "face", "imgUrl": public_url, "num": 10},
+                timeout=12,
+            )
+            for item in r.json().get("items", []):
+                url = item.get("link", "")
+                if url and url not in seen:
+                    seen.add(url)
+                    matches.append({
+                        "url":       url,
+                        "title":     item.get("title", ""),
+                        "photo_url": item.get("image", {}).get("thumbnailLink"),
+                        "platform":  _platform(url),
+                        "source":    "cse_image",
+                    })
+        except Exception as e:
+            logger.debug(f"CSE image: {e}")
+
+    # Social profile text search
+    if name_hint:
+        for site in [
+            "site:linkedin.com/in",
+            "site:github.com",
+            "site:instagram.com",
+            "site:twitter.com OR site:x.com",
+            "site:researchgate.net",
+        ]:
+            try:
+                r = requests.get(
+                    "https://www.googleapis.com/customsearch/v1",
+                    params={"key": key, "cx": cx, "num": 5,
+                            "q": f'"{name_hint}" {site}'},
+                    timeout=10,
+                )
+                for item in r.json().get("items", []):
+                    url = item.get("link", "")
+                    if url and url not in seen:
+                        seen.add(url)
+                        matches.append({
+                            "url":      url,
+                            "title":    item.get("title", ""),
+                            "snippet":  item.get("snippet", "")[:200],
+                            "platform": _platform(url),
+                            "source":   "cse_social",
+                        })
+                time.sleep(0.1)
+            except Exception as e:
+                logger.debug(f"CSE {site}: {e}")
+
+    logger.info(f"Google CSE: {len(matches)} candidates")
+    return matches
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 5 — PimEyes (paid API stub)
+# ══════════════════════════════════════════════════════════════════════════
+def _search_pimeyes(image_b64: str) -> list:
+    """Search PimEyes API. Returns [] if key not set or API fails."""
+    try:
+        key = getattr(config, "PIMEYES_API_KEY", "")
+        if not key:
+            return []
+        r = requests.post(
+            "https://pimeyes.com/api/search/advanced",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": config.BROWSER_HEADERS["User-Agent"],
+            },
+            json={"image": image_b64},
+            timeout=20,
+        )
+        if not r.ok:
+            logger.debug(f"PimEyes: HTTP {r.status_code}")
+            return []
+        data = r.json()
+        matches = []
+        for hit in data.get("results", [])[:20]:
+            url        = hit.get("url", "") or hit.get("pageUrl", "")
+            thumb      = hit.get("thumbnailUrl", "") or hit.get("thumbnail", "")
+            title      = hit.get("name", "") or hit.get("title", "")
+            if not url:
+                continue
+            matches.append({
+                "source":      "pimeyes",
+                "url":         url,
+                "preview_url": thumb or None,
+                "snippet":     title,
+                "platform":    _platform(url),
+            })
+        logger.info(f"PimEyes: {len(matches)} results")
+        return matches
+    except Exception as e:
+        logger.debug(f"PimEyes: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FACE VERIFICATION (DeepFace inline)
+# ══════════════════════════════════════════════════════════════════════════
+def _fetch_image(url: str, photo_url: Optional[str] = None) -> Optional[bytes]:
+    for try_url in filter(None, [photo_url, url]):
+        try:
+            r = requests.get(try_url, headers=config.BROWSER_HEADERS,
+                             timeout=8, allow_redirects=True)
+            if not r.ok:
+                continue
+            ct = r.headers.get("content-type", "")
+            if "image/" in ct:
+                return r.content
+            if "html" in ct:
+                soup = BeautifulSoup(r.text, "html.parser")
+                for meta in soup.find_all("meta"):
+                    prop = meta.get("property", "") or meta.get("name", "")
+                    if prop in ("og:image", "twitter:image"):
+                        img_url = meta.get("content", "")
+                        if img_url and img_url.startswith("http"):
+                            r2 = requests.get(img_url, headers=config.BROWSER_HEADERS,
+                                              timeout=6)
+                            if r2.ok and "image/" in r2.headers.get("content-type", ""):
+                                return r2.content
+        except Exception:
+            pass
+    return None
+
+
+def _verify_one(query_np: np.ndarray, cand: dict) -> dict:
+    cand.setdefault("face_verified", False)
+    cand.setdefault("face_score", None)
+    cand.setdefault("face_similarity", 0.0)
+
+    img_bytes = _fetch_image(cand.get("url", ""), cand.get("photo_url"))
+    if not img_bytes:
+        cand["_no_image"] = True
+        return cand
+    try:
+        buf        = np.frombuffer(img_bytes, dtype=np.uint8)
+        cand_frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if cand_frame is None:
+            return cand
+        from deepface import DeepFace
+        res = DeepFace.verify(
+            img1_path=query_np, img2_path=cand_frame,
+            model_name="Facenet512", detector_backend="opencv",
+            enforce_detection=False, silent=True,
+        )
+        sim = round(max(0.0, 1.0 - float(res.get("distance", 1.0))), 4)
+        cand["face_similarity"] = sim
+        cand["face_score"]      = sim
+        cand["face_verified"]   = sim >= FACE_POSSIBLE
+        cand["no_face_photo"]   = False
+    except Exception as e:
+        logger.debug(f"verify {cand.get('url','')[:60]}: {e}")
+    return cand
+
+
+def _batch_verify(query_np: np.ndarray, candidates: list[dict]) -> list[dict]:
+    if not candidates:
+        return []
+    logger.info(f"Face-verify: {len(candidates)} candidates (threshold={FACE_POSSIBLE})")
+    with ThreadPoolExecutor(max_workers=VERIFY_WORKERS) as pool:
+        results = [f.result() for f in as_completed(
+            [pool.submit(_verify_one, query_np, c) for c in candidates[:MAX_CANDIDATES]]
+        )]
+    results.sort(key=lambda c: c.get("face_similarity", 0), reverse=True)
+    confirmed = sum(1 for c in results if c.get("face_verified"))
+    logger.info(f"Face-verify: {confirmed}/{len(results)} confirmed")
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  IDENTITY ENRICHMENT
+# ══════════════════════════════════════════════════════════════════════════
+def _enrich(match: dict) -> dict:
+    url      = match.get("url", "")
+    platform = match.get("platform", "")
+    try:
+        r = requests.get(url, headers=config.BROWSER_HEADERS, timeout=8)
+        if not r.ok:
+            return match
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        def og(p):
+            t = soup.find("meta", property=f"og:{p}")
+            return (t.get("content", "") if t else "").strip()
+
+        title  = og("title") or (soup.title.string if soup.title else "") or ""
+        avatar = og("image") or ""
+        desc   = og("description") or ""
+        match.setdefault("title", title[:140])
+        match.setdefault("bio",   desc[:200])
+        if avatar and not match.get("photo_url"):
+            match["photo_url"] = avatar
+
+        if platform == "GitHub":
+            for sel in (".p-name",):
+                el = soup.select_one(sel)
+                if el: match["name"] = el.get_text(strip=True); break
+            for sel in (".p-nickname",):
+                el = soup.select_one(sel)
+                if el: match["username"] = el.get_text(strip=True); break
+            uname = match.get("username", "")
+            if uname and getattr(config, "GITHUB_TOKEN", ""):
+                try:
+                    gh = requests.get(
+                        f"https://api.github.com/users/{uname}",
+                        headers={"Authorization": f"token {config.GITHUB_TOKEN}"},
+                        timeout=8,
+                    ).json()
+                    for k in ("name", "bio", "company", "location", "email"):
+                        if gh.get(k): match.setdefault(k, gh[k])
+                    if gh.get("avatar_url"):
+                        match["photo_url"] = gh["avatar_url"]
+                except Exception:
+                    pass
+
+        if not match.get("name") and title:
+            cand = re.split(r"\s*[\|—–\-]\s*", title)[0].strip()
+            if 2 <= len(cand.split()) <= 5:
+                match.setdefault("name", cand)
+    except Exception as e:
+        logger.debug(f"enrich {url}: {e}")
+    return match
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
+def scrape(context: dict) -> dict:
+    name_hint = context.get("name", "")
+    image_b64 = context.get("image_b64", "")
+
+    if not image_b64:
+        return {"source": "reverse_face", "matches": [], "error": "no image_b64 in context"}
+
+    try:
+        img_bytes = base64.b64decode(image_b64.split(",")[-1])
+    except Exception as e:
+        return {"source": "reverse_face", "matches": [], "error": str(e)}
+
+    buf      = np.frombuffer(img_bytes, dtype=np.uint8)
+    query_np = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if query_np is None:
+        return {"source": "reverse_face", "matches": [], "error": "cv2 decode failed"}
+
+    logger.info(
+        f"=== FACE-FIRST ENGINE === hint='{name_hint}' "
+        f"{query_np.shape[1]}x{query_np.shape[0]}px"
+    )
+
+    # Upload face to public URL first (needed by SerpApi)
+    public_url = _host_image(img_bytes)
+
+    all_candidates: list[dict] = []
+    detected_names: list[str]  = []
+
+    # All 4 engines in parallel
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_sl = pool.submit(_serpapi_lens,   public_url)
+        f_sy = pool.submit(_serpapi_yandex, public_url)
+        f_yd = pool.submit(_yandex_direct,  img_bytes)
+        f_cse= pool.submit(_google_cse,     name_hint, public_url)
+
+        sl_res, sl_names = f_sl.result()
+        sy_res, sy_names = f_sy.result()
+        yd_res, yd_names = f_yd.result()
+        cse_res          = f_cse.result()
+
+    all_candidates += sl_res + sy_res + yd_res + cse_res
+    detected_names  += sl_names + sy_names + yd_names
+
+    # Engine 5 — PimEyes (paid, silently skipped if key not set)
+    try:
+        pimeyes_res = _search_pimeyes(image_b64)
+        all_candidates += pimeyes_res
+    except Exception as e:
+        logger.debug(f"PimEyes wrapper: {e}")
+
+    # Deduplicate
+    seen, unique = set(), []
+    for c in all_candidates:
+        u = c.get("url", "")
+        if u and u not in seen:
+            seen.add(u); unique.append(c)
+
+    # Social profiles first (more likely to have face photo + identity)
+    social  = [c for c in unique if _platform(c["url"]) != "Web"]
+    other   = [c for c in unique if _platform(c["url"]) == "Web"]
+    ordered = (social + other)[:MAX_CANDIDATES]
+
+    logger.info(f"Candidates: {len(ordered)} ({len(social)} social, {len(other)} other)")
+
+    # Face verification
+    verified    = _batch_verify(query_np, ordered)
+    confirmed   = [c for c in verified if c.get("face_verified")]
+    unconfirmed = [c for c in verified if not c.get("face_verified")]
+
+    # Collect names from confirmed results
+    for c in confirmed:
+        t = (c.get("title", "") or "").split(" - ")[0].split(" | ")[0].strip()
+        if t and 2 <= len(t.split()) <= 5 and t not in detected_names:
+            detected_names.append(t)
+    if not detected_names and name_hint:
+        detected_names = [name_hint]
+
+    # Enrich confirmed social profiles with identity data
+    for c in confirmed:
+        if _platform(c["url"]) != "Web":
+            _enrich(c)
+
+    # CSE name-based expansion after face confirms a name
+    cse_extra = []
+    if detected_names:
+        cse_extra = _google_cse(detected_names[0], None)
+        for cr in cse_extra:
+            if cr.get("photo_url"):
+                _verify_one(query_np, cr)
+
+    # Final merge
+    final = confirmed + cse_extra + unconfirmed
+    seen2, deduped = set(), []
+    for m in final:
+        u = m.get("url", "")
+        if u and u not in seen2:
+            seen2.add(u); deduped.append(m)
+
+    n_confirmed = sum(1 for m in deduped if m.get("face_verified"))
+    logger.info(
+        f"reverse_face complete: {len(deduped)} matches, "
+        f"{n_confirmed} face-confirmed, names={detected_names}"
+    )
+
+    return {
+        "source":               "reverse_face",
+        "matches":              deduped,
+        "names_found":          detected_names,
+        "face_confirmed_count": n_confirmed,
+    }

@@ -1,0 +1,34 @@
+## Face OSINT — run: pip install -r requirements.txt
+## Python 3.10 or 3.11 recommended (3.12 breaks TensorFlow 2.16)
+
+## Core web framework
+flask
+flask-cors
+requests
+python-dotenv
+
+## HTML parsing
+beautifulsoup4
+lxml
+
+## Image & camera
+opencv-python
+numpy
+Pillow
+
+## Face recognition (downloads ~600MB models on first run)
+deepface
+tensorflow
+
+## String similarity for entity resolution (optional but strongly recommended)
+## Falls back to a slower pure-Python implementation if not installed
+rapidfuzz
+
+## Username OSINT tools (optional — Layer 1 and Layer 2 in username.py)
+## Install these for better username coverage:
+##   pip install sherlock-project socid-extractor
+# sherlock-project
+# socid-extractor
+
+## Reddit with authentication (optional — falls back to public JSON without it)
+# praw
