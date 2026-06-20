@@ -39,3 +39,10 @@ anthropic>=0.25
 # sherlock-project   # username OSINT — 300+ platforms (vs 125 built-in direct checks)
 # socid-extractor    # social ID extraction from profile pages
 # praw               # authenticated Reddit API (falls back to public JSON without it)
+
+# ── Playwright (browser-based scrapers) ──────────────────────────────────────────────
+# Adds ENGINE 6 (Google Lens) + ENGINE 7 (Bing Visual) to reverse_face.py
+# and Layer 4 JS-profile verification to username.py. All free, no API keys.
+# After pip install, run:  playwright install chromium
+# On WSL2 also run:        playwright install-deps chromium
+# playwright
