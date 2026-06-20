@@ -32,3 +32,9 @@ rapidfuzz
 
 ## Reddit with authentication (optional — falls back to public JSON without it)
 # praw
+
+## Crowd Intelligence Center (CIC) — install for full functionality
+## YOLOv8n person detection (auto-downloads 6MB model on first run)
+ultralytics>=8.0
+## Claude API for LLM operator assistant (set ANTHROPIC_API_KEY in .env)
+anthropic>=0.25

@@ -829,6 +829,151 @@ def api_wifi_disconnect():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  CROWD INTELLIGENCE CENTER — ROUTES
+# ══════════════════════════════════════════════════════════════════════════
+from crowd.platform import get_platform
+
+@app.route("/crowd/api/zones")
+def cic_zones():
+    return jsonify(get_platform().get_zones_raw())
+
+@app.route("/crowd/api/status")
+def cic_status():
+    return jsonify(get_platform().get_state())
+
+@app.route("/crowd/api/stream")
+def cic_stream():
+    plat = get_platform()
+    q    = plat.subscribe()
+    def gen():
+        try:
+            while True:
+                try:
+                    msg = q.get(timeout=25)
+                    yield f"data:{json.dumps(msg, default=str)}\n\n"
+                except queue.Empty:
+                    yield 'data:{"hb":1}\n\n'
+        finally:
+            plat.unsubscribe(q)
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/crowd/api/slot/<int:slot>/start", methods=["POST"])
+def cic_start_slot(slot):
+    if slot < 0 or slot > 3:
+        return jsonify(error="Slot must be 0–3"), 400
+    d      = request.get_json() or {}
+    source = d.get("source", "")
+    if source == "webcam" or source == "" or source == "0":
+        source = 0
+    elif source.lstrip("-").isdigit():
+        source = int(source)
+    ok = get_platform().start_slot(slot, source)
+    if not ok:
+        return jsonify(error=f"Cannot open source '{source}'"), 400
+    return jsonify(ok=True, slot=slot, source=str(source))
+
+@app.route("/crowd/api/slot/<int:slot>/stop", methods=["POST"])
+def cic_stop_slot(slot):
+    get_platform().stop_slot(slot)
+    return jsonify(ok=True)
+
+@app.route("/crowd/api/frame/<int:slot>")
+def cic_frame(slot):
+    b64 = get_platform().get_slot_frame_b64(slot)
+    if b64 is None:
+        return jsonify(ok=False, error="No frame"), 404
+    return jsonify(ok=True, frame=b64)
+
+@app.route("/crowd/api/heatmap")
+def cic_heatmap():
+    return jsonify(points=get_platform().get_heatmap())
+
+@app.route("/crowd/api/slot/<int:slot>/toggle", methods=["POST"])
+def cic_slot_toggle(slot):
+    d     = request.get_json() or {}
+    name  = d.get("name", "")
+    value = bool(d.get("value", True))
+    get_platform().set_toggle(slot, name, value)
+    return jsonify(ok=True)
+
+@app.route("/crowd/api/ask", methods=["POST"])
+def cic_ask():
+    from crowd.llm_ops import ask as llm_ask
+    d        = request.get_json() or {}
+    question = (d.get("question") or "").strip()
+    if not question:
+        return jsonify(error="question required"), 400
+    api_key  = config.ANTHROPIC_API_KEY
+    state    = get_platform().get_state()
+    def gen():
+        for chunk in llm_ask(question, state, api_key):
+            yield f"data:{json.dumps({'text': chunk})}\n\n"
+        yield 'data:{"done":true}\n\n'
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/crowd/api/khoya", methods=["POST"])
+def cic_khoya():
+    """Khoya-Paya: search face against OSINT db + CIC crowd captures."""
+    import base64, io, numpy as np
+    d = request.get_json() or {}
+    b64 = d.get("image", "")
+    if not b64:
+        return jsonify(error="image required"), 400
+    try:
+        # Decode image
+        raw = base64.b64decode(b64.split(",", 1)[-1])
+        arr = np.frombuffer(raw, np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify(error="invalid image"), 400
+
+        import embedding as emb_mod
+        result = emb_mod.extract(frame)
+        if not result or result.get("embedding") is None:
+            return jsonify(found=False, reason="no_face")
+
+        vec = np.array(result["embedding"], dtype=np.float32)
+
+        # 1. Search existing OSINT face vectors
+        osint_hits = db.find_similar_faces(vec, top_k=3, threshold=0.45)
+
+        # 2. Search CIC crowd captures
+        cic_hits = db.find_cic_captures(vec, top_k=3, threshold=0.45)
+        cic_count = db.get_cic_capture_count()
+
+        # Merge and rank
+        matches = []
+        for h in osint_hits:
+            matches.append({
+                "source":     "osint",
+                "name":       h["name"],
+                "score":      h["score"],
+                "search_id":  h["search_id"],
+            })
+        for h in cic_hits:
+            matches.append({
+                "source":     "cic",
+                "name":       f"Unknown (Track #{h['track_id']})",
+                "score":      h["score"],
+                "zone":       h["zone_name"],
+                "slot":       h["slot_id"],
+                "last_seen":  h["captured_at"],
+            })
+        matches.sort(key=lambda x: x["score"], reverse=True)
+
+        return jsonify(
+            found=bool(matches),
+            matches=matches[:5],
+            cic_faces_indexed=cic_count,
+        )
+    except Exception as e:
+        logger.warning(f"Khoya-Paya error: {e}")
+        return jsonify(error=str(e)), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  EMBEDDED FRONTEND
 # ══════════════════════════════════════════════════════════════════════════
 _HTML = r"""<!DOCTYPE html>
@@ -1618,7 +1763,76 @@ body{
 .it{background:var(--bg-elevated);border:1px solid var(--border);border-radius:8px;padding:8px 12px}
 .lbl{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin-bottom:3px}
 .val{font-size:11px;word-break:break-all;color:var(--text-primary)}
+
+/* ════════ CROWD INTELLIGENCE CENTER (CIC) ════════════════════════════ */
+#cic-overlay{display:none;position:fixed;inset:0;z-index:200;background:var(--bg-base);flex-direction:column}
+#cic-overlay.open{display:flex}
+.cic-topbar{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap}
+.cic-title{font-weight:700;font-size:14px;color:var(--accent);white-space:nowrap}
+.cic-tabs{display:flex;gap:5px;flex:1;flex-wrap:wrap}
+.cic-tab{background:transparent;border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;padding:4px 11px;font-size:11px;cursor:pointer;transition:background .15s,color .15s}
+.cic-tab:hover{background:var(--bg-elevated);color:var(--text-primary)}
+.cic-tab.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.cic-close{background:var(--red-dim);border:1px solid rgba(239,68,68,.4);color:var(--red);border-radius:6px;padding:4px 12px;font-size:11px;cursor:pointer;white-space:nowrap;transition:background .15s}
+.cic-close:hover{background:var(--red);color:#fff}
+#cic-total-badge{font-size:11px;color:var(--text-secondary);white-space:nowrap}
+#cic-total-badge b{color:var(--accent)}
+.hb.cic-btn{border-color:rgba(99,102,241,.4);color:rgba(99,102,241,.85)}
+.hb.cic-btn:hover,.hb.cic-btn.on{background:var(--accent-glow);border-color:var(--accent);color:var(--accent)}
+.cic-panel{display:none;flex:1;overflow:hidden;flex-direction:column;min-height:0}
+.cic-panel.active{display:flex}
+.cic-status-dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex-shrink:0}
+.cic-status-dot.live{background:var(--green);box-shadow:0 0 5px var(--green)}
+.cic-status-dot.offline{background:var(--text-muted)}
+.cic-cam-grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;padding:8px;flex:1;min-height:0}
+.cic-cam-tile{background:var(--bg-card);border:2px solid var(--border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;transition:border-color .3s}
+.cic-cam-tile.offline{opacity:.5}
+.cic-cam-header{display:flex;align-items:center;gap:5px;padding:5px 8px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0}
+.cic-cam-name{font-weight:600;color:var(--text-primary);flex:1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cic-cam-badge{background:var(--accent);color:#fff;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;white-space:nowrap}
+.cic-cam-img{width:100%;flex:1;object-fit:cover;display:block;background:#0a0c14;min-height:0}
+.cic-cam-footer{display:flex;align-items:center;gap:8px;padding:4px 8px;font-size:10px;flex-shrink:0;border-top:1px solid var(--border)}
+.cic-slot-ctrl{display:flex;gap:3px;margin-left:auto}
+.cic-btn-sm{background:var(--bg-base);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:2px 6px;font-size:9px;cursor:pointer;transition:.15s}
+.cic-btn-sm:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+.cic-risk-safe{color:var(--green)}
+.cic-risk-caution{color:var(--yellow)}
+.cic-risk-high{color:#f97316}
+.cic-risk-critical{color:var(--red);font-weight:700;animation:cic-blink 1s ease-in-out infinite}
+@keyframes cic-blink{0%,100%{opacity:1}50%{opacity:.35}}
+#cic-map{flex:1;min-height:0}
+.cic-alerts-layout{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.cic-alert-log{flex:1;overflow-y:auto;padding:8px;min-height:0}
+.cic-alert-item{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;border-left:3px solid;font-size:11px}
+.cic-alert-item.warning{border-color:var(--yellow);background:var(--yellow-dim)}
+.cic-alert-item.high{border-color:#f97316;background:rgba(249,115,22,.1)}
+.cic-alert-item.critical{border-color:var(--red);background:var(--red-dim)}
+.cic-alert-zone{font-weight:700;color:var(--text-primary);white-space:nowrap}
+.cic-alert-msg{color:var(--text-secondary);flex:1}
+.cic-alert-ts{font-size:9px;color:var(--text-muted);white-space:nowrap}
+.cic-llm-panel{border-top:1px solid var(--border);padding:10px;display:flex;flex-direction:column;gap:6px;flex-shrink:0;background:var(--bg-card)}
+.cic-llm-title{font-size:11px;font-weight:700;color:var(--accent)}
+.cic-llm-response{background:var(--bg-base);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;color:var(--text-primary);min-height:55px;max-height:130px;overflow-y:auto;white-space:pre-wrap;line-height:1.5}
+.cic-llm-input-row{display:flex;gap:6px}
+#cic-llm-q{flex:1;background:var(--bg-elevated);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:11px;color:var(--text-primary);outline:none}
+#cic-llm-q:focus{border-color:var(--accent)}
+.cic-analytics-layout{flex:1;display:flex;gap:10px;padding:10px;min-height:0}
+.cic-chart-card{flex:1;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;min-width:0}
+.cic-chart-title{font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:8px;flex-shrink:0}
+.cic-chart-wrap{flex:1;position:relative;min-height:0}
+.cic-chart-wrap canvas{position:absolute;inset:0;width:100%!important;height:100%!important}
+.cic-khoya-layout{padding:20px;display:flex;flex-direction:column;gap:14px;max-width:560px;margin:0 auto;flex:1;overflow-y:auto}
+.cic-khoya-title{font-size:16px;font-weight:700;color:var(--text-primary)}
+.cic-khoya-sub{font-size:12px;color:var(--text-secondary);line-height:1.5}
+.cic-upload-zone{border:2px dashed var(--border-bright);border-radius:8px;padding:24px;text-align:center;color:var(--text-muted);font-size:12px;cursor:pointer;transition:border-color .15s;display:flex;flex-direction:column;align-items:center;gap:8px}
+.cic-upload-zone:hover{border-color:var(--accent);color:var(--text-secondary)}
+.cic-khoya-results{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.7}
+.cic-toggle-bar{display:flex;align-items:center;gap:5px;padding:5px 10px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap}
+.cic-toggle-sep{flex:1}
+.cic-tog{background:var(--bg-base);border:1px solid var(--border);color:var(--text-muted);border-radius:4px;padding:2px 7px;font-size:9px;cursor:pointer;transition:.15s}
+.cic-tog.on{background:var(--accent-glow);border-color:var(--accent);color:var(--accent)}
 </style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
 </head>
 <body>
 
@@ -1672,6 +1886,7 @@ body{
     <button class="hb" id="hb-theme" onclick="toggleTheme()" title="Toggle theme">&#9788; Light</button>
     <button class="hb" onclick="document.getElementById('shortcuts-bg').classList.add('show')" title="Keyboard shortcuts">?</button>
     <button class="hb kill" id="hb-kill" disabled onclick="killSearch()">&#9760; Kill</button>
+    <button class="hb cic-btn" id="hb-cic" onclick="toggleCIC()" title="Crowd Intelligence Center">&#9889; CIC</button>
   </div>
 </div>
 
@@ -1883,6 +2098,171 @@ body{
 
 </div><!-- /main-layout -->
 </div><!-- /app-shell -->
+
+<!-- ╔══════════════════════════════════════════════════════════════════╗
+     ║  CROWD INTELLIGENCE CENTER OVERLAY                               ║
+     ╚══════════════════════════════════════════════════════════════════╝ -->
+<div id="cic-overlay">
+  <!-- CIC top bar -->
+  <div class="cic-topbar">
+    <span class="cic-title">&#9889; Crowd Intelligence Center</span>
+    <div class="cic-tabs">
+      <button class="cic-tab active" id="cic-tabn-cameras" onclick="cicTab('cameras')">&#128249; Cameras</button>
+      <button class="cic-tab" id="cic-tabn-map"       onclick="cicTab('map')">&#128205; Zone Map</button>
+      <button class="cic-tab" id="cic-tabn-alerts"    onclick="cicTab('alerts')">&#128680; Alerts &amp; SOP</button>
+      <button class="cic-tab" id="cic-tabn-analytics" onclick="cicTab('analytics')">&#128202; Analytics</button>
+      <button class="cic-tab" id="cic-tabn-khoya"     onclick="cicTab('khoya')">&#128269; Lost Person</button>
+    </div>
+    <div id="cic-total-badge">Total: <b>0</b> persons</div>
+    <button class="cic-close" onclick="toggleCIC()">&#10005; Exit CIC</button>
+  </div>
+
+  <!-- Tab 1: Live Cameras 2x2 grid -->
+  <div class="cic-panel active" id="cic-panel-cameras">
+    <!-- Overlay toggles toolbar -->
+    <div class="cic-toggle-bar" id="cic-toggle-bar">
+      <span style="font-size:10px;color:var(--text-muted);white-space:nowrap">OVERLAY:</span>
+      <button class="cic-tog on" id="tog-show_bbox"       onclick="cicToggle('show_bbox')">Boxes</button>
+      <button class="cic-tog on" id="tog-show_track_id"   onclick="cicToggle('show_track_id')">Track&nbsp;ID</button>
+      <button class="cic-tog on" id="tog-show_suspicious" onclick="cicToggle('show_suspicious')">Suspicious</button>
+      <button class="cic-tog on" id="tog-show_children"   onclick="cicToggle('show_children')">Children</button>
+      <button class="cic-tog on" id="tog-show_flow"       onclick="cicToggle('show_flow')">Flow&nbsp;Arrow</button>
+      <button class="cic-tog on" id="tog-show_count"      onclick="cicToggle('show_count')">Count</button>
+      <span class="cic-toggle-sep"></span>
+      <span style="font-size:10px;color:var(--text-muted)">ALARM:</span>
+      <button class="cic-tog" id="tog-audio" onclick="cicToggleAudio()">&#128266; Audio</button>
+    </div>
+    <!-- 2x2 camera grid -->
+    <div class="cic-cam-grid">
+      <div class="cic-cam-tile offline" id="cic-tile-0">
+        <div class="cic-cam-header">
+          <span class="cic-status-dot offline" id="cic-dot-0"></span>
+          <span class="cic-cam-name">Slot 0 &mdash; Sangam Ghat</span>
+          <span class="cic-cam-badge" id="cic-badge-0">--</span>
+          <div class="cic-slot-ctrl">
+            <button class="cic-btn-sm" onclick="cicStartSlot(0)">&#9654; Start</button>
+            <button class="cic-btn-sm" onclick="cicStopSlot(0)">&#9632; Stop</button>
+          </div>
+        </div>
+        <img class="cic-cam-img" id="cic-frame-0" alt=""/>
+        <div class="cic-cam-footer">
+          <span class="cic-risk-safe" id="cic-risk-0">OFFLINE</span>
+          <span style="color:var(--text-muted);font-size:10px" id="cic-dens-0">0.000 p/m&#178;</span>
+          <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-0"></span>
+        </div>
+      </div>
+      <div class="cic-cam-tile offline" id="cic-tile-1">
+        <div class="cic-cam-header">
+          <span class="cic-status-dot offline" id="cic-dot-1"></span>
+          <span class="cic-cam-name">Slot 1 &mdash; Pontoon Bridge</span>
+          <span class="cic-cam-badge" id="cic-badge-1">--</span>
+          <div class="cic-slot-ctrl">
+            <button class="cic-btn-sm" onclick="cicStartSlot(1)">&#9654; Start</button>
+            <button class="cic-btn-sm" onclick="cicStopSlot(1)">&#9632; Stop</button>
+          </div>
+        </div>
+        <img class="cic-cam-img" id="cic-frame-1" alt=""/>
+        <div class="cic-cam-footer">
+          <span class="cic-risk-safe" id="cic-risk-1">OFFLINE</span>
+          <span style="color:var(--text-muted);font-size:10px" id="cic-dens-1">0.000 p/m&#178;</span>
+          <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-1"></span>
+        </div>
+      </div>
+      <div class="cic-cam-tile offline" id="cic-tile-2">
+        <div class="cic-cam-header">
+          <span class="cic-status-dot offline" id="cic-dot-2"></span>
+          <span class="cic-cam-name">Slot 2 &mdash; Sector 4 Entry</span>
+          <span class="cic-cam-badge" id="cic-badge-2">--</span>
+          <div class="cic-slot-ctrl">
+            <button class="cic-btn-sm" onclick="cicStartSlot(2)">&#9654; Start</button>
+            <button class="cic-btn-sm" onclick="cicStopSlot(2)">&#9632; Stop</button>
+          </div>
+        </div>
+        <img class="cic-cam-img" id="cic-frame-2" alt=""/>
+        <div class="cic-cam-footer">
+          <span class="cic-risk-safe" id="cic-risk-2">OFFLINE</span>
+          <span style="color:var(--text-muted);font-size:10px" id="cic-dens-2">0.000 p/m&#178;</span>
+          <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-2"></span>
+        </div>
+      </div>
+      <div class="cic-cam-tile offline" id="cic-tile-3">
+        <div class="cic-cam-header">
+          <span class="cic-status-dot offline" id="cic-dot-3"></span>
+          <span class="cic-cam-name">Slot 3 &mdash; Approach Road</span>
+          <span class="cic-cam-badge" id="cic-badge-3">--</span>
+          <div class="cic-slot-ctrl">
+            <button class="cic-btn-sm" onclick="cicStartSlot(3)">&#9654; Start</button>
+            <button class="cic-btn-sm" onclick="cicStopSlot(3)">&#9632; Stop</button>
+          </div>
+        </div>
+        <img class="cic-cam-img" id="cic-frame-3" alt=""/>
+        <div class="cic-cam-footer">
+          <span class="cic-risk-safe" id="cic-risk-3">OFFLINE</span>
+          <span style="color:var(--text-muted);font-size:10px" id="cic-dens-3">0.000 p/m&#178;</span>
+          <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-3"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 2: Zone Map (Leaflet.js) -->
+  <div class="cic-panel" id="cic-panel-map">
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;font-size:11px">
+      <span style="color:var(--text-muted)">Map layers:</span>
+      <button class="cic-btn-sm" id="map-toggle-heat" onclick="cicToggleHeatmap()">&#127777; Heat Map OFF</button>
+      <button class="cic-btn-sm" onclick="cicRefreshMap()">&#8635; Refresh Zones</button>
+      <span style="margin-left:auto;color:var(--text-muted)">Prayagraj Kumbh Mela — Triveni Sangam</span>
+    </div>
+    <div id="cic-map" style="flex:1;min-height:0"></div>
+  </div>
+
+  <!-- Tab 3: Alerts + LLM SOP assistant -->
+  <div class="cic-panel" id="cic-panel-alerts">
+    <div class="cic-alerts-layout">
+      <div class="cic-alert-log" id="cic-alert-log">
+        <div style="color:var(--text-muted);font-size:12px;padding:12px">No alerts &mdash; monitoring active zones&hellip;</div>
+      </div>
+      <div class="cic-llm-panel">
+        <div class="cic-llm-title">&#9889; AI Operator Assistant (Claude)</div>
+        <div class="cic-llm-response" id="cic-llm-response" style="color:var(--text-muted)">Ask about current crowd conditions, which zones need attention, or SOP guidance&hellip;</div>
+        <div class="cic-llm-input-row">
+          <input id="cic-llm-q" type="text" placeholder="e.g. Which zones need immediate attention?" onkeydown="if(event.key==='Enter')cicAsk()"/>
+          <button class="cic-btn-sm" onclick="cicAsk()" style="padding:5px 14px;font-size:11px">Ask</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 4: Analytics -->
+  <div class="cic-panel" id="cic-panel-analytics">
+    <div class="cic-analytics-layout">
+      <div class="cic-chart-card">
+        <div class="cic-chart-title">Zone Occupancy (persons detected)</div>
+        <div class="cic-chart-wrap"><canvas id="cic-bar-canvas"></canvas></div>
+      </div>
+      <div class="cic-chart-card">
+        <div class="cic-chart-title">Zone Density (persons / m&#178;)</div>
+        <div class="cic-chart-wrap"><canvas id="cic-density-canvas"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 5: Khoya-Paya (Lost Person) -->
+  <div class="cic-panel" id="cic-panel-khoya">
+    <div class="cic-khoya-layout">
+      <div class="cic-khoya-title">&#128269; Khoya-Paya &mdash; Lost Person Search</div>
+      <div class="cic-khoya-sub">Upload a photo of the missing person. The system will search face embeddings collected from all active camera feeds and historical searches.</div>
+      <div class="cic-upload-zone" onclick="document.getElementById('cic-khoya-input').click()">
+        <img id="cic-khoya-preview" style="max-height:130px;max-width:200px;border-radius:6px;display:none" alt=""/>
+        <div>&#128247; Click to upload photo</div>
+        <div style="font-size:10px;color:var(--text-muted)">JPG, PNG, WEBP supported</div>
+      </div>
+      <input type="file" id="cic-khoya-input" accept="image/*" style="display:none" onchange="cicKhoyaFile(this)"/>
+      <div class="cic-khoya-results" id="cic-khoya-results" style="display:none"></div>
+    </div>
+  </div>
+</div>
+<!-- /CIC overlay -->
 
 <div id="toasts"></div>
 
@@ -2957,6 +3337,613 @@ function esc(s){
 }
 
 loadHistory();
+
+/* ════════════════════════════════════════════════════════════════════════
+   CROWD INTELLIGENCE CENTER — JavaScript
+   ════════════════════════════════════════════════════════════════════════ */
+
+// ── State ─────────────────────────────────────────────────────────────────
+var _cicOpen       = false;
+var _cicPollTimer  = null;
+var _cicSSE        = null;
+var _cicMapObj     = null;
+var _cicZonePolys  = {};
+var _cicHeatLayer  = null;
+var _cicHeatOn     = false;
+var _cicHeatTimer  = null;
+var _cicBarChart   = null;
+var _cicDenChart   = null;
+var _cicActiveSlots = new Set();
+var _cicZoneSlotMap = {};   // zoneId → slot int
+var _cicZoneList    = [];   // raw zones from API
+var _cicToggleState = {     // mirrors server toggle state
+  show_bbox: true, show_track_id: true, show_suspicious: true,
+  show_children: true, show_flow: true, show_count: true
+};
+var _cicAudioOn    = false;
+var _cicLastCritical = 0;   // timestamp of last audio alarm
+
+var _RISK_FILL = {safe:'#22c55e', caution:'#f59e0b', high:'#f97316', critical:'#ef4444'};
+var _RISK_BORDER = {safe:'var(--green)', caution:'var(--yellow)', high:'#f97316', critical:'var(--red)'};
+
+// ── Toggle overlay ─────────────────────────────────────────────────────────
+function toggleCIC() {
+  _cicOpen = !_cicOpen;
+  var el  = document.getElementById('cic-overlay');
+  var btn = document.getElementById('hb-cic');
+  el.classList.toggle('open', _cicOpen);
+  if (btn) btn.classList.toggle('on', _cicOpen);
+  if (_cicOpen) {
+    _cicLoadZones();
+    _cicSyncSlots();      // restore server-side active slots
+    _cicConnectSSE();
+    _cicStartPolling();
+  } else {
+    _cicStopPolling();
+    if (_cicSSE) { _cicSSE.close(); _cicSSE = null; }
+    if (_cicHeatTimer) { clearInterval(_cicHeatTimer); _cicHeatTimer = null; }
+  }
+}
+
+// ── Sync server slot state into browser ───────────────────────────────────
+function _cicSyncSlots() {
+  fetch('/crowd/api/status').then(function(r) { return r.json(); }).then(function(d) {
+    (d.slots || []).forEach(function(s) {
+      if (!s.active) return;
+      var slot = s.slot;
+      _cicActiveSlots.add(slot);
+      var tile = document.getElementById('cic-tile-' + slot);
+      var dot  = document.getElementById('cic-dot-' + slot);
+      if (tile) tile.classList.remove('offline');
+      if (dot)  dot.className = 'cic-status-dot live';
+    });
+  }).catch(function() {});
+}
+
+// ── Tab switching ──────────────────────────────────────────────────────────
+function cicTab(name) {
+  document.querySelectorAll('.cic-panel').forEach(function(p) { p.classList.remove('active'); });
+  document.querySelectorAll('.cic-tab').forEach(function(t) { t.classList.remove('active'); });
+  var panel = document.getElementById('cic-panel-' + name);
+  var tab   = document.getElementById('cic-tabn-' + name);
+  if (panel) panel.classList.add('active');
+  if (tab)   tab.classList.add('active');
+  if (name === 'map') {
+    if (!_cicMapObj) _cicInitMap();
+    else setTimeout(function() { if (_cicMapObj) _cicMapObj.invalidateSize(); }, 50);
+  }
+  if (name === 'analytics' && !_cicBarChart) {
+    setTimeout(_cicInitCharts, 50);
+  }
+}
+
+// ── Zone config ────────────────────────────────────────────────────────────
+function _cicLoadZones() {
+  fetch('/crowd/api/zones').then(function(r) { return r.json(); }).then(function(data) {
+    _cicZoneList = data.zones || [];
+    _cicZoneList.forEach(function(z) {
+      _cicZoneSlotMap[z.id] = z.camera_slot;
+    });
+  }).catch(function() {});
+}
+
+// ── Frame polling ──────────────────────────────────────────────────────────
+function _cicStartPolling() {
+  if (_cicPollTimer) return;
+  _cicPollTimer = setInterval(_cicFetchFrames, 300);
+}
+function _cicStopPolling() {
+  if (_cicPollTimer) { clearInterval(_cicPollTimer); _cicPollTimer = null; }
+}
+function _cicFetchFrames() {
+  _cicActiveSlots.forEach(function(slot) {
+    fetch('/crowd/api/frame/' + slot)
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) {
+          var img = document.getElementById('cic-frame-' + slot);
+          if (img) img.src = d.frame;
+        }
+      }).catch(function() {});
+  });
+}
+
+// ── Platform SSE ───────────────────────────────────────────────────────────
+function _cicConnectSSE() {
+  if (_cicSSE) { _cicSSE.close(); _cicSSE = null; }
+  _cicSSE = new EventSource('/crowd/api/stream');
+  _cicSSE.onmessage = function(e) {
+    try {
+      var d = JSON.parse(e.data);
+      if (d.hb || !d.type) return;
+      if (d.type === 'update') _cicHandleUpdate(d);
+    } catch (ex) {}
+  };
+  _cicSSE.onerror = function() {
+    if (_cicSSE) { _cicSSE.close(); _cicSSE = null; }
+    if (_cicOpen) setTimeout(_cicConnectSSE, 4000);
+  };
+}
+
+function _cicHandleUpdate(d) {
+  var zones = d.zones || {};
+  var total = d.total_count || 0;
+
+  // Total badge
+  var tb = document.getElementById('cic-total-badge');
+  if (tb) tb.innerHTML = 'Total: <b>' + total + '</b> persons';
+
+  // Per-slot badges + tile borders
+  Object.keys(zones).forEach(function(zid) {
+    var z    = zones[zid];
+    var slot = _cicZoneSlotMap[zid];
+    if (slot === undefined) return;
+
+    var badge = document.getElementById('cic-badge-' + slot);
+    if (badge) badge.textContent = z.count;
+
+    var riskEl = document.getElementById('cic-risk-' + slot);
+    if (riskEl) {
+      riskEl.textContent  = z.risk.toUpperCase();
+      riskEl.className    = 'cic-risk-' + z.risk;
+    }
+    var densEl = document.getElementById('cic-dens-' + slot);
+    if (densEl) densEl.textContent = (z.density || 0).toFixed(3) + ' p/m²';
+
+    var tile = document.getElementById('cic-tile-' + slot);
+    if (tile) tile.style.borderColor = _RISK_BORDER[z.risk] || 'var(--border)';
+
+    // Behavioral footer badge
+    var bhvEl = document.getElementById('cic-bhv-' + slot);
+    if (bhvEl) {
+      var parts = [];
+      if (z.n_suspicious > 0) parts.push('! ' + z.n_suspicious + ' susp');
+      if (z.n_running    > 0) parts.push(z.n_running + ' run');
+      if (z.n_children   > 0) parts.push(z.n_children + ' child');
+      bhvEl.textContent = parts.join(' | ');
+      bhvEl.style.color = z.n_suspicious > 0 ? '#f97316' : 'var(--text-muted)';
+    }
+
+    // Leaflet zone polygon color
+    _cicUpdateZonePoly(zid, z.risk);
+  });
+
+  // New alerts + audio alarm
+  if (d.alerts && d.alerts.length) {
+    d.alerts.forEach(_cicAddAlert);
+    var hasCritical = d.alerts.some(function(a) { return a.severity === 'critical'; });
+    if (hasCritical) _cicPlayAlarm();
+  }
+
+  // Charts live update
+  if (_cicBarChart) _cicLiveUpdateCharts(zones);
+}
+
+// ── Overlay toggles ─────────────────────────────────────────────────────────
+function cicToggle(name) {
+  _cicToggleState[name] = !_cicToggleState[name];
+  var btn = document.getElementById('tog-' + name);
+  if (btn) btn.classList.toggle('on', _cicToggleState[name]);
+  _cicActiveSlots.forEach(function(slot) {
+    fetch('/crowd/api/slot/' + slot + '/toggle', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name, value: _cicToggleState[name]})
+    }).catch(function() {});
+  });
+}
+
+function cicToggleAudio() {
+  _cicAudioOn = !_cicAudioOn;
+  var btn = document.getElementById('tog-audio');
+  if (btn) btn.classList.toggle('on', _cicAudioOn);
+}
+
+function _cicPlayAlarm() {
+  if (!_cicAudioOn) return;
+  var now = Date.now();
+  if (now - _cicLastCritical < 30000) return;  // 30s cooldown
+  _cicLastCritical = now;
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1100, 880].forEach(function(freq, i) {
+      var osc  = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      osc.type = 'square';
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + i * 0.25);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.25 + 0.2);
+      osc.start(ctx.currentTime + i * 0.25);
+      osc.stop(ctx.currentTime + i * 0.25 + 0.25);
+    });
+  } catch(e) {}
+}
+
+// ── Slot management ────────────────────────────────────────────────────────
+function cicStartSlot(slot) {
+  var dataDir = 'Place your video in data\\ folder (e.g. data\\crowd.mp4)';
+  var src = prompt(
+    'Camera Slot ' + slot + ' — enter video source:\n\n' +
+    '  0                       = local webcam\n' +
+    '  data\\crowd.mp4          = video file in project data\\ folder\n' +
+    '  D:\\full\\path\\video.mp4  = full Windows path\n' +
+    '  192.168.x.x:8080        = IP camera (auto-probes endpoints)\n' +
+    '  rtsp://...               = RTSP stream URL\n\n' +
+    'Tip: ' + dataDir,
+    slot === 0 ? '0' : 'data\\'
+  );
+  if (src === null || src === undefined) return;
+  src = src.trim();
+  fetch('/crowd/api/slot/' + slot + '/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({source: src || '0'})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      _cicActiveSlots.add(slot);
+      var tile = document.getElementById('cic-tile-' + slot);
+      var dot  = document.getElementById('cic-dot-' + slot);
+      if (tile) tile.classList.remove('offline');
+      if (dot)  { dot.className = 'cic-status-dot live'; }
+      if (typeof toast === 'function') toast('Slot ' + slot + ' started', 'ok');
+    } else {
+      if (typeof toast === 'function') toast('Cannot open: ' + (d.error || 'unknown error'), 'er');
+      else alert('Cannot open: ' + (d.error || 'unknown error'));
+    }
+  }).catch(function(e) {
+    if (typeof toast === 'function') toast('Network error', 'er');
+  });
+}
+
+function cicStopSlot(slot) {
+  fetch('/crowd/api/slot/' + slot + '/stop', {method: 'POST'}).catch(function() {});
+  _cicActiveSlots.delete(slot);
+  var img  = document.getElementById('cic-frame-' + slot);
+  var tile = document.getElementById('cic-tile-' + slot);
+  var dot  = document.getElementById('cic-dot-' + slot);
+  var risk = document.getElementById('cic-risk-' + slot);
+  var badge= document.getElementById('cic-badge-' + slot);
+  if (img)   { img.src = ''; }
+  if (tile)  { tile.classList.add('offline'); tile.style.borderColor = ''; }
+  if (dot)   { dot.className = 'cic-status-dot offline'; }
+  if (risk)  { risk.textContent = 'OFFLINE'; risk.className = 'cic-risk-safe'; }
+  if (badge) { badge.textContent = '--'; }
+}
+
+// ── Alert log ──────────────────────────────────────────────────────────────
+function _cicAddAlert(a) {
+  var log = document.getElementById('cic-alert-log');
+  if (!log) return;
+  // Remove placeholder
+  var placeholder = log.querySelector('div[style]');
+  if (placeholder && placeholder.textContent.includes('No alerts')) placeholder.remove();
+
+  var div = document.createElement('div');
+  div.className = 'cic-alert-item ' + (a.severity || 'warning');
+  div.innerHTML =
+    '<span class="cic-alert-ts">' + (a.timestamp || '') + '</span>' +
+    '<span class="cic-alert-zone">' + (a.zone || '') + '</span>' +
+    '<span class="cic-alert-msg">' + (a.message || '') + '</span>';
+  log.insertBefore(div, log.firstChild);
+  while (log.children.length > 60) log.removeChild(log.lastChild);
+
+  // Flash alerts tab if not on it
+  var alertsTab = document.getElementById('cic-tabn-alerts');
+  if (alertsTab && !alertsTab.classList.contains('active')) {
+    alertsTab.style.animation = 'cic-blink 0.4s ease-in-out 3';
+    setTimeout(function() { alertsTab.style.animation = ''; }, 1300);
+  }
+}
+
+// ── Leaflet GIS Map ────────────────────────────────────────────────────────
+function _cicInitMap() {
+  if (typeof L === 'undefined') {
+    var mapEl = document.getElementById('cic-map');
+    if (mapEl) mapEl.innerHTML = '<div style="padding:20px;color:var(--text-muted);font-size:12px">Leaflet.js not available. Check internet connection.</div>';
+    return;
+  }
+  fetch('/crowd/api/zones').then(function(r) { return r.json(); }).then(function(data) {
+    var venue  = data.venue || {};
+    var center = venue.center || [25.4232, 81.8845];
+    var zoom   = venue.zoom   || 14;
+
+    _cicMapObj = L.map('cic-map').setView(center, zoom);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 19
+    }).addTo(_cicMapObj);
+
+    (data.zones || []).forEach(function(z) {
+      var latlngs = (z.lat_lon || []).map(function(p) { return [p[0], p[1]]; });
+      var poly = L.polygon(latlngs, {
+        color: z.color || '#6366f1',
+        fillColor: z.color || '#6366f1',
+        fillOpacity: 0.3,
+        weight: 2
+      }).addTo(_cicMapObj);
+      poly.bindPopup(
+        '<b>' + z.name + '</b><br>' + (z.description || '') +
+        '<br>Area: ' + z.area_m2 + ' m² &bull; Capacity: ' + z.capacity
+      );
+      _cicZonePolys[z.id] = poly;
+    });
+  }).catch(function(e) {
+    console.warn('CIC map init error:', e);
+  });
+}
+
+function _cicUpdateZonePoly(zid, risk) {
+  var poly = _cicZonePolys[zid];
+  if (!poly) return;
+  var col = _RISK_FILL[risk] || '#6366f1';
+  poly.setStyle({fillColor: col, color: col, fillOpacity: risk === 'safe' ? 0.2 : 0.45});
+}
+
+function cicToggleHeatmap() {
+  _cicHeatOn = !_cicHeatOn;
+  var btn = document.getElementById('map-toggle-heat');
+  if (btn) btn.textContent = (_cicHeatOn ? 'Heat Map ON' : 'Heat Map OFF');
+  if (_cicHeatOn) {
+    _cicUpdateHeatmap();
+    _cicHeatTimer = setInterval(_cicUpdateHeatmap, 2000);
+  } else {
+    if (_cicHeatTimer) { clearInterval(_cicHeatTimer); _cicHeatTimer = null; }
+    if (_cicHeatLayer && _cicMapObj) { _cicMapObj.removeLayer(_cicHeatLayer); _cicHeatLayer = null; }
+  }
+}
+
+function _cicUpdateHeatmap() {
+  if (!_cicMapObj || typeof L === 'undefined') return;
+  fetch('/crowd/api/heatmap').then(function(r) { return r.json(); }).then(function(d) {
+    var pts = d.points || [];
+    if (_cicHeatLayer) _cicMapObj.removeLayer(_cicHeatLayer);
+    if (typeof L.heatLayer === 'undefined') {
+      // Load Leaflet.heat plugin dynamically
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js';
+      s.onload = function() {
+        _cicHeatLayer = L.heatLayer(pts, {radius:25, blur:20, maxZoom:17, max:1.0,
+          gradient:{0.0:'blue',0.3:'lime',0.6:'yellow',0.8:'orange',1.0:'red'}}).addTo(_cicMapObj);
+      };
+      document.head.appendChild(s);
+    } else {
+      _cicHeatLayer = L.heatLayer(pts, {radius:25, blur:20, maxZoom:17,
+        gradient:{0.0:'blue',0.3:'lime',0.6:'yellow',0.8:'orange',1.0:'red'}}).addTo(_cicMapObj);
+    }
+  }).catch(function() {});
+}
+
+function cicRefreshMap() {
+  if (_cicMapObj) { _cicMapObj.remove(); _cicMapObj = null; _cicZonePolys = {}; }
+  _cicInitMap();
+}
+
+// ── Chart.js Analytics ─────────────────────────────────────────────────────
+function _cicInitCharts() {
+  if (typeof Chart === 'undefined') return;
+  fetch('/crowd/api/status').then(function(r) { return r.json(); }).then(function(d) {
+    var zones   = d.zones || {};
+    var names   = Object.values(zones).map(function(z) { return z.name; });
+    var counts  = Object.values(zones).map(function(z) { return z.count || 0; });
+    var densities = Object.values(zones).map(function(z) { return +(z.density || 0).toFixed(4); });
+    var colors  = Object.values(zones).map(function(z) { return z.color || '#6366f1'; });
+
+    var barCtx = document.getElementById('cic-bar-canvas').getContext('2d');
+    _cicBarChart = new Chart(barCtx, {
+      type: 'bar',
+      data: {
+        labels: names,
+        datasets: [{
+          label: 'Persons',
+          data: counts,
+          backgroundColor: colors.map(function(c) { return c + 'aa'; }),
+          borderColor: colors,
+          borderWidth: 1.5,
+          borderRadius: 4
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {legend: {display: false}},
+        scales: {
+          x: {ticks: {color:'#94a3b8', font:{size:10}}, grid: {color:'#252836'}},
+          y: {ticks: {color:'#94a3b8', font:{size:10}}, grid: {color:'#252836'}, beginAtZero: true}
+        }
+      }
+    });
+
+    var denCtx = document.getElementById('cic-density-canvas').getContext('2d');
+    _cicDenChart = new Chart(denCtx, {
+      type: 'bar',
+      data: {
+        labels: names,
+        datasets: [{
+          label: 'p/m²',
+          data: densities,
+          backgroundColor: densities.map(function(v) {
+            return v >= 6 ? '#ef4444aa' : v >= 3 ? '#f97316aa' : v >= 1.5 ? '#f59e0baa' : '#22c55eaa';
+          }),
+          borderColor: densities.map(function(v) {
+            return v >= 6 ? '#ef4444' : v >= 3 ? '#f97316' : v >= 1.5 ? '#f59e0b' : '#22c55e';
+          }),
+          borderWidth: 1.5,
+          borderRadius: 4
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {legend: {display: false}},
+        scales: {
+          x: {ticks: {color:'#94a3b8', font:{size:10}}, grid: {color:'#252836'}},
+          y: {ticks: {color:'#94a3b8', font:{size:10}}, grid: {color:'#252836'}, beginAtZero: true}
+        }
+      }
+    });
+  }).catch(function() {});
+}
+
+function _cicLiveUpdateCharts(zones) {
+  if (!_cicBarChart || !_cicDenChart) return;
+  var names = _cicBarChart.data.labels;
+  var counts = [], dens = [];
+  names.forEach(function(name) {
+    var z = Object.values(zones).find(function(zz) { return zz.name === name; });
+    counts.push(z ? (z.count || 0) : 0);
+    dens.push(z   ? +(z.density || 0).toFixed(4) : 0);
+  });
+  _cicBarChart.data.datasets[0].data = counts;
+  _cicBarChart.update('none');
+
+  _cicDenChart.data.datasets[0].data = dens;
+  _cicDenChart.data.datasets[0].backgroundColor = dens.map(function(v) {
+    return v >= 6 ? '#ef4444aa' : v >= 3 ? '#f97316aa' : v >= 1.5 ? '#f59e0baa' : '#22c55eaa';
+  });
+  _cicDenChart.data.datasets[0].borderColor = dens.map(function(v) {
+    return v >= 6 ? '#ef4444' : v >= 3 ? '#f97316' : v >= 1.5 ? '#f59e0b' : '#22c55e';
+  });
+  _cicDenChart.update('none');
+}
+
+// ── LLM Operator Assistant ─────────────────────────────────────────────────
+function cicAsk() {
+  var qEl  = document.getElementById('cic-llm-q');
+  var resp = document.getElementById('cic-llm-response');
+  if (!qEl || !resp) return;
+  var q = qEl.value.trim();
+  if (!q) return;
+
+  resp.textContent = 'Thinking…';
+  resp.style.color = 'var(--text-muted)';
+
+  fetch('/crowd/api/ask', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({question: q})
+  }).then(function(r) {
+    var reader  = r.body.getReader();
+    var decoder = new TextDecoder();
+    var text    = '';
+    resp.textContent = '';
+    resp.style.color = 'var(--text-primary)';
+
+    function pump() {
+      reader.read().then(function(res) {
+        if (res.done) return;
+        var raw = decoder.decode(res.value, {stream: true});
+        raw.split('\n').forEach(function(line) {
+          if (line.startsWith('data:')) {
+            try {
+              var msg = JSON.parse(line.slice(5));
+              if (msg.done) return;
+              if (msg.text) { text += msg.text; resp.textContent = text; resp.scrollTop = resp.scrollHeight; }
+            } catch (ex) {}
+          }
+        });
+        pump();
+      }).catch(function() {});
+    }
+    pump();
+  }).catch(function(e) {
+    resp.textContent = 'Error: ' + e.message;
+    resp.style.color = 'var(--red)';
+  });
+}
+
+// ── Khoya-Paya (Lost Person Search) ───────────────────────────────────────
+function cicKhoyaFile(input) {
+  var file = input.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var b64 = e.target.result;
+    var prev = document.getElementById('cic-khoya-preview');
+    var res  = document.getElementById('cic-khoya-results');
+    if (prev) { prev.src = b64; prev.style.display = 'block'; }
+    if (res)  { res.style.display = 'block'; res.innerHTML = '<span style="color:var(--text-muted)">Searching face database…</span>'; }
+
+    fetch('/crowd/api/khoya', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({image: b64})
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (!res) return;
+      if (d.error === 'no_face') {
+        res.innerHTML =
+          '<div style="color:var(--yellow);font-weight:600;margin-bottom:6px">&#9888; No face detected</div>' +
+          'Upload a clear, well-lit frontal photo. Avoid sunglasses or head coverings.<br>' +
+          '<small style="color:var(--text-muted)">Faces indexed from cameras: ' + (d.cic_faces_indexed||0) + '</small>';
+        return;
+      }
+      if (d.error) {
+        res.innerHTML = '<span style="color:var(--red)">Error: ' + d.error + '</span>';
+        return;
+      }
+      if (d.found && d.matches && d.matches.length) {
+        var html = '<div style="color:var(--green);font-weight:700;margin-bottom:10px">&#10003; ' + d.matches.length + ' match(es) found</div>';
+        d.matches.forEach(function(m, i) {
+          var pct = (m.score * 100).toFixed(1);
+          var icon = m.source === 'cic' ? '&#128247;' : '&#128269;';
+          html += '<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px">';
+          html += '<b>' + icon + ' #' + (i+1) + ' — ' + m.name + '</b><br>';
+          html += 'Confidence: <b style="color:var(--green)">' + pct + '%</b><br>';
+          if (m.source === 'cic') {
+            html += 'Source: Live Camera (Slot ' + m.slot + ')<br>';
+            html += 'Zone: <b>' + m.zone + '</b><br>';
+            html += 'Last seen: ' + m.last_seen;
+          } else {
+            html += 'Source: OSINT database<br>';
+            html += 'Search ID: ' + m.search_id;
+          }
+          html += '</div>';
+        });
+        html += '<small style="color:var(--text-muted)">Faces indexed from cameras: ' + (d.cic_faces_indexed||0) + '</small>';
+        res.innerHTML = html;
+      } else {
+        var indexed = d.cic_faces_indexed || 0;
+        res.innerHTML =
+          '<div style="color:var(--yellow);font-weight:600;margin-bottom:6px">No match found</div>' +
+          'This person was not found in the face database.<br><br>' +
+          '<b>Faces indexed from cameras: ' + indexed + '</b><br>' +
+          (indexed === 0
+            ? '<small style="color:var(--text-muted)">Start a camera slot and wait ~60s for faces to be captured automatically.</small>'
+            : '<small style="color:var(--text-muted)">Try a clearer frontal photo, or the person may not have been captured yet.</small>');
+      }
+    }).catch(function(e) {
+      if (res) res.textContent = 'Error: ' + e.message;
+    });
+  };
+  reader.readAsDataURL(file);
+}
+
+// Load Leaflet + Chart.js CDN lazily when CIC first opens
+(function() {
+  function loadScript(src, id, cb) {
+    if (document.getElementById(id)) { if (cb) cb(); return; }
+    var s = document.createElement('script');
+    s.src = src; s.id = id; s.onload = cb || null;
+    document.head.appendChild(s);
+  }
+  // Expose helper so toggleCIC can trigger load
+  window._cicLoadLibs = function(cb) {
+    loadScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', 'cic-leaflet-js', function() {
+      loadScript('https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js', 'cic-chartjs', cb);
+    });
+  };
+})();
+
+// Patch toggleCIC to load libs first
+var _toggleCICOrig = toggleCIC;
+toggleCIC = function() {
+  if (!_cicOpen) {
+    window._cicLoadLibs(function() { _toggleCICOrig(); });
+  } else {
+    _toggleCICOrig();
+  }
+};
+
+loadHistory();
 </script>
 </body>
 </html>"""
@@ -2969,16 +3956,16 @@ if __name__ == "__main__":
     PORT = 5000
     URL  = f"http://localhost:{PORT}"
 
-    print("\n" + "═"*56)
-    print("  Face OSINT v4.2  ·  WiFi Camera + Dark/Light Mode")
-    print("═"*56)
-    print(f"\n  ✅ Opening: {URL}")
-    print(f"  📁 Output:  {config.OUTPUT_DIR}")
-    print(f"  🗄  DB:      {config.DB_PATH}")
-    print(f"  📋 Logs:    {config.LOG_DIR}")
-    print("\n  WiFi Cam: click '📡 WiFi Cam' tab → enter 192.168.x.x:8080")
-    print("  Theme:    click '☀ Light' button in header to toggle")
-    print("═"*56 + "\n")
+    sep = "=" * 56
+    print("\n" + sep)
+    print("  Face OSINT v4.2  +  Crowd Intelligence Center")
+    print(sep)
+    print(f"\n  Opening: {URL}")
+    print(f"  Output:  {config.OUTPUT_DIR}")
+    print(f"  DB:      {config.DB_PATH}")
+    print(f"  Logs:    {config.LOG_DIR}")
+    print("\n  CIC: click [CIC] button in top bar")
+    print(sep + "\n")
 
     # ISSUE 5 FIX: bind to 127.0.0.1 — camera works, no IP leak
     # Auto-open browser after 1.2s (gives Flask time to start)

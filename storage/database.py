@@ -73,6 +73,19 @@ CREATE TABLE IF NOT EXISTS face_vectors (
 CREATE INDEX IF NOT EXISTS idx_searches_name    ON searches(name);
 CREATE INDEX IF NOT EXISTS idx_matches_search   ON matches(search_id);
 CREATE INDEX IF NOT EXISTS idx_matches_verdict  ON matches(verdict);
+
+-- CIC crowd-sourced face captures (no FK to searches — independent pipeline)
+CREATE TABLE IF NOT EXISTS cic_face_captures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id    INTEGER NOT NULL,
+    slot_id     INTEGER NOT NULL,
+    zone_id     TEXT NOT NULL,
+    zone_name   TEXT NOT NULL,
+    vector_blob BLOB NOT NULL,
+    captured_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cic_cap_track  ON cic_face_captures(track_id);
+CREATE INDEX IF NOT EXISTS idx_cic_cap_slot   ON cic_face_captures(slot_id);
 """
 
 
@@ -248,6 +261,64 @@ class Database:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
+
+    # ── CIC crowd face captures ───────────────────────────────────────────
+    def store_cic_capture(
+        self,
+        track_id:  int,
+        slot_id:   int,
+        zone_id:   str,
+        zone_name: str,
+        vector:    "np.ndarray",
+    ):
+        blob = vector.astype(np.float32).tobytes()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO cic_face_captures
+                   (track_id, slot_id, zone_id, zone_name, vector_blob, captured_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (track_id, slot_id, zone_id, zone_name, blob, _now()),
+            )
+
+    def find_cic_captures(
+        self,
+        query_vector: "np.ndarray",
+        top_k:        int = 5,
+        threshold:    float = 0.45,
+    ) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT id, track_id, slot_id, zone_id, zone_name,
+                          vector_blob, captured_at
+                   FROM cic_face_captures"""
+            ).fetchall()
+        if not rows:
+            return []
+
+        from embedding import cosine_similarity
+        scored = []
+        for row in rows:
+            try:
+                vec   = np.frombuffer(row["vector_blob"], dtype=np.float32)
+                score = cosine_similarity(query_vector, vec)
+                if score >= threshold:
+                    scored.append({
+                        "id":         row["id"],
+                        "track_id":   row["track_id"],
+                        "slot_id":    row["slot_id"],
+                        "zone_id":    row["zone_id"],
+                        "zone_name":  row["zone_name"],
+                        "captured_at": row["captured_at"],
+                        "score":      round(score, 4),
+                    })
+            except Exception:
+                pass
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:top_k]
+
+    def get_cic_capture_count(self) -> int:
+        with self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM cic_face_captures").fetchone()[0]
 
 
 def _now() -> str:

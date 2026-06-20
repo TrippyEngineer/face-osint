@@ -1,0 +1,65 @@
+{
+  "venue": {
+    "name": "Prayagraj Kumbh Mela — Triveni Sangam",
+    "center": [25.4232, 81.8845],
+    "zoom": 14
+  },
+  "zones": [
+    {
+      "id": "zone_a",
+      "name": "Sangam Ghat",
+      "description": "Main bathing ghat at Triveni Sangam confluence",
+      "lat_lon": [
+        [25.4275, 81.8820], [25.4280, 81.8870],
+        [25.4265, 81.8875], [25.4260, 81.8825]
+      ],
+      "area_m2": 8000,
+      "capacity": 16000,
+      "camera_slot": 0,
+      "thresholds": {"caution": 1.5, "high": 3.0, "critical": 6.0},
+      "color": "#6366f1"
+    },
+    {
+      "id": "zone_b",
+      "name": "Pontoon Bridge",
+      "description": "Main floating bridge — bidirectional flow bottleneck",
+      "lat_lon": [
+        [25.4240, 81.8830], [25.4240, 81.8860],
+        [25.4225, 81.8860], [25.4225, 81.8830]
+      ],
+      "area_m2": 2000,
+      "capacity": 4000,
+      "camera_slot": 1,
+      "thresholds": {"caution": 2.0, "high": 4.5, "critical": 7.0},
+      "color": "#06b6d4"
+    },
+    {
+      "id": "zone_c",
+      "name": "Sector 4 — Entry Plaza",
+      "description": "Main visitor entry and exit sector",
+      "lat_lon": [
+        [25.4195, 81.8800], [25.4200, 81.8845],
+        [25.4182, 81.8848], [25.4177, 81.8803]
+      ],
+      "area_m2": 12000,
+      "capacity": 20000,
+      "camera_slot": 2,
+      "thresholds": {"caution": 1.0, "high": 2.5, "critical": 5.0},
+      "color": "#8b5cf6"
+    },
+    {
+      "id": "zone_d",
+      "name": "Approach Road",
+      "description": "Main vehicle and pedestrian approach corridor",
+      "lat_lon": [
+        [25.4165, 81.8810], [25.4165, 81.8850],
+        [25.4152, 81.8850], [25.4152, 81.8810]
+      ],
+      "area_m2": 5000,
+      "capacity": 8000,
+      "camera_slot": 3,
+      "thresholds": {"caution": 1.2, "high": 2.8, "critical": 5.5},
+      "color": "#f59e0b"
+    }
+  ]
+}

@@ -136,6 +136,20 @@ FACECHECK_API_KEY = os.getenv("FACECHECK_API_KEY", "")
 PIMEYES_API_KEY  = os.getenv("PIMEYES_API_KEY",  "")
 # Optional: set this to your email to get into OpenAlex's "polite pool" (higher rate limits)
 OPENALEX_MAILTO  = os.getenv("OPENALEX_MAILTO",  "")
+# Claude API key — used by the CIC LLM operator assistant
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CROWD INTELLIGENCE CENTER (CIC)                                     ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+# Default risk thresholds (persons / m²) — overridden per-zone in zones.json
+CIC_DENSITY_CAUTION  = 1.5   # → yellow warning
+CIC_DENSITY_HIGH     = 3.0   # → orange high risk
+CIC_DENSITY_CRITICAL = 6.0   # → red critical / stampede alert
+
+CIC_INFERENCE_FPS    = 5     # target FPS for YOLOv8n inference per slot
+CIC_MAX_SLOTS        = 4     # simultaneous camera slots
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
