@@ -121,20 +121,27 @@ def score_match(match: dict, query_name: str,
 
 
 def score_all(matches: list[dict], query_name: str,
-              query_location: str = "", query_company: str = "") -> list[dict]:
-    """Score all matches. Face-verified always rank above name-only."""
+              query_location: str = "", query_company: str = "",
+              min_score: float = None) -> list[dict]:
+    """Score all matches. Face-verified always rank above name-only.
+
+    min_score overrides the default MIN_SCORE_KEEP cutoff. The preliminary
+    (pre-face) pass passes a lower value so name/text candidates survive — the
+    scorer weights face at 0.70, so text-only matches score low until the face
+    engine confirms them in the final pass."""
     if not matches:
         return []
+    thresh = config.MIN_SCORE_KEEP if min_score is None else min_score
     scored = [score_match(m, query_name, query_location, query_company) for m in matches]
     scored.sort(key=lambda m: (int(m.get("face_verified",False)), m.get("combined_score",0)),
                 reverse=True)
 
     # Drop clearly noisy results below minimum threshold
     before_filter = len(scored)
-    scored = [m for m in scored if m.get("combined_score", 0) >= config.MIN_SCORE_KEEP]
+    scored = [m for m in scored if m.get("combined_score", 0) >= thresh]
     filtered_out = before_filter - len(scored)
     if filtered_out:
-        logger.info(f"Scorer v2: filtered {filtered_out} result(s) below MIN_SCORE_KEEP={config.MIN_SCORE_KEEP}")
+        logger.info(f"Scorer v2: filtered {filtered_out} result(s) below threshold={thresh}")
 
     confirmed = sum(1 for m in scored if m["verdict"]=="confirmed")
     possible  = sum(1 for m in scored if m["verdict"]=="possible")

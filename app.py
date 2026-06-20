@@ -79,6 +79,12 @@ _wifi_reader   = None   # camera.FrameReader instance
 _wifi_url      = ""     # currently connected URL
 _wifi_cam_lock = threading.Lock()
 
+# ── PERF: pre-warm the DeepFace model in the background at startup so the first
+# face search doesn't pay the ~30-40s cold-start (TensorFlow init + Facenet512
+# weight load). Daemon thread — never blocks startup; extract() still loads
+# lazily if this fails. Benchmarked: first-search embedding 38.1s -> 5.8s.
+threading.Thread(target=embedding.prewarm, daemon=True).start()
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  NAME PARSING — "John Doe, Mumbai" or "John Doe @ Google" or "John Doe"
@@ -256,13 +262,56 @@ def run_search(sid: str, frame: np.ndarray, name: str,
         all_results = {}
         _t0         = time.time()
         _fut_dl: dict = {}   # future → its individual deadline
+        _partial_emitted = False
 
-        with ThreadPoolExecutor(max_workers=config.SCRAPER_MAX_WORKERS) as pool:
+        def _emit_partial():
+            """PERF: once every source except reverse_face is in, push a quick
+            name/text-scored result so the user sees ranked hits almost
+            immediately instead of waiting for reverse_face (the slow face
+            engine). No face matching here (that needs network) — the final
+            'done' event re-scores with face verification and overwrites this."""
+            flat = [m for s, d in all_results.items() if isinstance(d, dict)
+                    for m in d.get("matches", [])]
+            if not flat:
+                return
+            try:
+                # Lower floor than the final MIN_SCORE_KEEP (0.25): face scores
+                # aren't in yet and the scorer weights face at 0.70, so text-only
+                # candidates score low. Show name/text candidates now; the final
+                # 'done' re-scores with face verification and re-applies 0.25.
+                sm = scorer.score_all(flat, query_name=name,
+                                      query_location=location, query_company=company,
+                                      min_score=0.08)
+                ident = resolver.resolve(name, sm)
+                clean = {k: v for k, v in ident.items() if k != "all_profiles"}
+                push(step="partial", partial=True,
+                     msg="Preliminary results — face search still running…",
+                     identity=clean, all_matches=sm[:60],
+                     total=sum(len(v.get("matches", [])) for v in all_results.values()
+                               if isinstance(v, dict)))
+                log("INFO", "partial", f"Preliminary results: {len(sm)} scored matches")
+            except Exception as e:
+                log("WARN", "partial", f"Partial scoring failed: {e}")
+
+        # PERF FIX (lag): do NOT use `with` here. Its implicit shutdown(wait=True)
+        # blocks run_search until EVERY scraper thread finishes — including ones
+        # that already blew past their per-scraper deadline. f.cancel() can't stop
+        # a thread that has already started, so total latency tracked the slowest
+        # stuck scraper (benchmarked: username ran 156s against its 50s cap,
+        # reverse_face 139s against 90s) instead of the max deadline. We shut the
+        # pool down with wait=False in `finally` so abandoned scrapers finish in
+        # the background while the pipeline proceeds with whatever completed in time.
+        pool = ThreadPoolExecutor(max_workers=config.SCRAPER_MAX_WORKERS)
+        try:
             futs: dict = {}
+            _SLOW_LABELS = {"reverse_face", "username", "passive"}
+            slow_futs = set()   # the slow scrapers — partial fires once only these remain
             for lbl, mod, fn, c, t in SCRAPERS:
                 f = pool.submit(_scrape, mod, fn, c)
                 futs[f]    = lbl
                 _fut_dl[f] = _t0 + t
+                if lbl in _SLOW_LABELS:
+                    slow_futs.add(f)
             pending = set(futs.keys())
 
             while pending:
@@ -317,6 +366,21 @@ def run_search(sid: str, frame: np.ndarray, name: str,
                         log("ERROR", lbl, f"Exception: {e}")
                         push(step="scraping", msg=f"{lbl} error",
                              scraper=lbl, count=0, err=str(e))
+
+                # PERF: emit preliminary scored results once the fast sources are
+                # all in (only the slow ones — reverse_face/username/passive —
+                # remain), so the user sees ranked hits ~12s in instead of waiting
+                # the full ~70s for reverse_face.
+                if (not _partial_emitted and pending
+                        and pending.issubset(slow_futs)):
+                    _emit_partial()
+                    _partial_emitted = True
+        finally:
+            # Abandon still-running scrapers instead of joining them — they
+            # already missed their deadline, so waiting only adds dead time.
+            # cancel_futures cancels any that never started; wait=False lets the
+            # rest finish (and self-clean, e.g. playwright) in the background.
+            pool.shutdown(wait=False, cancel_futures=True)
 
         # ── Bing HTML fallback if search_engines returned nothing ─────
         se = all_results.get("search_engines", {})
@@ -873,6 +937,33 @@ def cic_start_slot(slot):
         return jsonify(error=f"Cannot open source '{source}'"), 400
     return jsonify(ok=True, slot=slot, source=str(source))
 
+@app.route("/crowd/api/slot/<int:slot>/upload", methods=["POST"])
+def cic_upload_slot(slot):
+    """Accept a video file upload and start that slot with the saved path."""
+    if slot < 0 or slot > 3:
+        return jsonify(error="Slot must be 0–3"), 400
+    f = request.files.get("video")
+    if not f or not f.filename:
+        return jsonify(error="No file provided"), 400
+    from werkzeug.utils import secure_filename
+    fname = secure_filename(f.filename) or f"slot{slot}_video.mp4"
+    save_dir = Path(app.root_path) / "data" / "uploads"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"slot{slot}_{fname}"
+    try:
+        f.save(str(save_path))
+    except Exception as e:
+        return jsonify(error=f"Save failed: {e}"), 500
+    abs_path = str(save_path.resolve())
+    ok = get_platform().start_slot(slot, abs_path)
+    if not ok:
+        try:
+            save_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return jsonify(error="Cannot open video — ensure it is a valid video file"), 400
+    return jsonify(ok=True, slot=slot, path=abs_path, filename=fname)
+
 @app.route("/crowd/api/slot/<int:slot>/stop", methods=["POST"])
 def cic_stop_slot(slot):
     get_platform().stop_slot(slot)
@@ -932,7 +1023,7 @@ def cic_khoya():
         import embedding as emb_mod
         result = emb_mod.extract(frame)
         if not result or result.get("embedding") is None:
-            return jsonify(found=False, reason="no_face")
+            return jsonify(found=False, error="no_face")
 
         vec = np.array(result["embedding"], dtype=np.float32)
 
@@ -1585,7 +1676,7 @@ body{
   background:var(--bg-elevated);border:1px solid var(--border);
   border-radius:8px;font-size:11px;
 }
-.ss-lbl{width:90px;flex-shrink:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ss-lbl{width:118px;flex-shrink:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ss-bar{flex:1;height:3px;background:var(--bg-card);border-radius:999px;overflow:hidden}
 .ss-fill{height:100%;border-radius:999px;transition:width .8s ease}
 .ss-n{flex-shrink:0;width:28px;text-align:right;font-weight:700;font-size:11px}
@@ -1617,7 +1708,12 @@ body{
   background:var(--green-dim);color:var(--green);
   padding:1px 6px;border-radius:999px;border:1px solid rgba(34,197,94,.3);
 }
-.mc-src{font-size:9px;color:var(--text-muted);margin-left:auto}
+.mc-src{font-size:9px;color:var(--text-muted);margin-left:auto;display:flex;align-items:center;gap:2px}
+.mc-pw{
+  font-size:9px;font-weight:700;letter-spacing:.04em;
+  background:rgba(46,173,51,.12);color:#2ead33;
+  padding:1px 5px;border-radius:999px;border:1px solid rgba(46,173,51,.3);
+}
 .mc-score-wrap{display:flex;align-items:center;gap:6px;margin-top:4px}
 .mc-score-bar-bg{flex:1;height:3px;background:var(--bg-elevated);border-radius:999px;overflow:hidden}
 .mc-score-bar-fill{height:100%;border-radius:999px}
@@ -1785,8 +1881,20 @@ body{
 .cic-status-dot.live{background:var(--green);box-shadow:0 0 5px var(--green)}
 .cic-status-dot.offline{background:var(--text-muted)}
 .cic-cam-grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;padding:8px;flex:1;min-height:0}
-.cic-cam-tile{background:var(--bg-card);border:2px solid var(--border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;transition:border-color .3s}
-.cic-cam-tile.offline{opacity:.5}
+.cic-cam-tile{background:var(--bg-card);border:2px solid var(--border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;transition:border-color .3s;position:relative}
+.cic-cam-tile.offline{opacity:.55}
+.cic-cam-tile.drag-over{border-color:var(--accent)!important;opacity:1!important}
+.cic-drop-overlay{
+  display:none;position:absolute;inset:0;z-index:20;pointer-events:none;
+  background:rgba(99,102,241,.15);
+  align-items:center;justify-content:center;flex-direction:column;gap:6px;
+  font-size:13px;font-weight:700;color:var(--accent);
+}
+.cic-cam-tile.drag-over .cic-drop-overlay{display:flex}
+.cic-upload-prog{
+  position:absolute;bottom:0;left:0;width:0%;height:3px;
+  background:var(--accent);transition:width .1s linear;z-index:21;
+}
 .cic-cam-header{display:flex;align-items:center;gap:5px;padding:5px 8px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0}
 .cic-cam-name{font-weight:600;color:var(--text-primary);flex:1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cic-cam-badge{background:var(--accent);color:#fff;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;white-space:nowrap}
@@ -1795,6 +1903,7 @@ body{
 .cic-slot-ctrl{display:flex;gap:3px;margin-left:auto}
 .cic-btn-sm{background:var(--bg-base);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:2px 6px;font-size:9px;cursor:pointer;transition:.15s}
 .cic-btn-sm:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+.cic-btn-sm.heat-on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .cic-risk-safe{color:var(--green)}
 .cic-risk-caution{color:var(--yellow)}
 .cic-risk-high{color:#f97316}
@@ -2135,12 +2244,15 @@ body{
     <!-- 2x2 camera grid -->
     <div class="cic-cam-grid">
       <div class="cic-cam-tile offline" id="cic-tile-0">
+        <div class="cic-drop-overlay">&#128249; Drop video here</div>
+        <div class="cic-upload-prog" id="cic-prog-0"></div>
         <div class="cic-cam-header">
           <span class="cic-status-dot offline" id="cic-dot-0"></span>
           <span class="cic-cam-name">Slot 0 &mdash; Sangam Ghat</span>
           <span class="cic-cam-badge" id="cic-badge-0">--</span>
           <div class="cic-slot-ctrl">
             <button class="cic-btn-sm" onclick="cicStartSlot(0)">&#9654; Start</button>
+            <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(0)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(0)">&#9632; Stop</button>
           </div>
         </div>
@@ -2150,14 +2262,18 @@ body{
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-0">0.000 p/m&#178;</span>
           <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-0"></span>
         </div>
+        <input type="file" id="cic-vid-0" accept="video/*" style="display:none" onchange="cicHandleVideoFile(this,0)">
       </div>
       <div class="cic-cam-tile offline" id="cic-tile-1">
+        <div class="cic-drop-overlay">&#128249; Drop video here</div>
+        <div class="cic-upload-prog" id="cic-prog-1"></div>
         <div class="cic-cam-header">
           <span class="cic-status-dot offline" id="cic-dot-1"></span>
           <span class="cic-cam-name">Slot 1 &mdash; Pontoon Bridge</span>
           <span class="cic-cam-badge" id="cic-badge-1">--</span>
           <div class="cic-slot-ctrl">
             <button class="cic-btn-sm" onclick="cicStartSlot(1)">&#9654; Start</button>
+            <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(1)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(1)">&#9632; Stop</button>
           </div>
         </div>
@@ -2167,14 +2283,18 @@ body{
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-1">0.000 p/m&#178;</span>
           <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-1"></span>
         </div>
+        <input type="file" id="cic-vid-1" accept="video/*" style="display:none" onchange="cicHandleVideoFile(this,1)">
       </div>
       <div class="cic-cam-tile offline" id="cic-tile-2">
+        <div class="cic-drop-overlay">&#128249; Drop video here</div>
+        <div class="cic-upload-prog" id="cic-prog-2"></div>
         <div class="cic-cam-header">
           <span class="cic-status-dot offline" id="cic-dot-2"></span>
           <span class="cic-cam-name">Slot 2 &mdash; Sector 4 Entry</span>
           <span class="cic-cam-badge" id="cic-badge-2">--</span>
           <div class="cic-slot-ctrl">
             <button class="cic-btn-sm" onclick="cicStartSlot(2)">&#9654; Start</button>
+            <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(2)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(2)">&#9632; Stop</button>
           </div>
         </div>
@@ -2184,14 +2304,18 @@ body{
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-2">0.000 p/m&#178;</span>
           <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-2"></span>
         </div>
+        <input type="file" id="cic-vid-2" accept="video/*" style="display:none" onchange="cicHandleVideoFile(this,2)">
       </div>
       <div class="cic-cam-tile offline" id="cic-tile-3">
+        <div class="cic-drop-overlay">&#128249; Drop video here</div>
+        <div class="cic-upload-prog" id="cic-prog-3"></div>
         <div class="cic-cam-header">
           <span class="cic-status-dot offline" id="cic-dot-3"></span>
           <span class="cic-cam-name">Slot 3 &mdash; Approach Road</span>
           <span class="cic-cam-badge" id="cic-badge-3">--</span>
           <div class="cic-slot-ctrl">
             <button class="cic-btn-sm" onclick="cicStartSlot(3)">&#9654; Start</button>
+            <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(3)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(3)">&#9632; Stop</button>
           </div>
         </div>
@@ -2201,6 +2325,7 @@ body{
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-3">0.000 p/m&#178;</span>
           <span style="color:var(--text-muted);font-size:9px;margin-left:auto" id="cic-bhv-3"></span>
         </div>
+        <input type="file" id="cic-vid-3" accept="video/*" style="display:none" onchange="cicHandleVideoFile(this,3)">
       </div>
     </div>
   </div>
@@ -2209,7 +2334,8 @@ body{
   <div class="cic-panel" id="cic-panel-map">
     <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg-card);border-bottom:1px solid var(--border);flex-shrink:0;font-size:11px">
       <span style="color:var(--text-muted)">Map layers:</span>
-      <button class="cic-btn-sm" id="map-toggle-heat" onclick="cicToggleHeatmap()">&#127777; Heat Map OFF</button>
+      <button class="cic-btn-sm" id="map-toggle-heat" onclick="cicToggleHeatmap()">&#127777; Heat Map</button>
+      <span id="cic-heat-status" style="font-size:9px;color:var(--text-muted)"></span>
       <button class="cic-btn-sm" onclick="cicRefreshMap()">&#8635; Refresh Zones</button>
       <span style="margin-left:auto;color:var(--text-muted)">Prayagraj Kumbh Mela — Triveni Sangam</span>
     </div>
@@ -2286,9 +2412,27 @@ const SRC_NODES = [
   {k:'passive',       ic:'🕵',nm:'Passive'},
   {k:'username',      ic:'🔑',nm:'Usernames'},
 ];
-const SLBL={search_engines:'Web',academic:'Academic',github:'GitHub',
-  reddit:'Reddit',passive:'Passive',reverse_face:'FaceSearch',
-  username:'Usernames'};
+const SLBL={
+  // Top-level scraper keys
+  search_engines:'Web Search',academic:'Academic',github:'GitHub',
+  reddit:'Reddit',passive:'Passive',reverse_face:'Face Search',
+  username:'Usernames',
+  // reverse_face sub-sources
+  serpapi_lens_visual_matches:'SerpApi Lens',serpapi_lens_exact_matches:'SerpApi Lens',
+  serpapi_lens_entity:'SerpApi Lens',serpapi_yandex:'SerpApi Yandex',
+  yandex_direct:'Yandex',yandex_json:'Yandex',
+  cse_image:'Google CSE',cse_social:'Google CSE',
+  pimeyes:'PimEyes',
+  playwright_google_lens:'Playwright Lens',
+  playwright_bing_visual:'Playwright Bing',
+  reverse_face_linkedin:'LinkedIn (enriched)',
+  // username sub-sources
+  sherlock:'Sherlock',direct_check:'Direct Check',
+  socid_extractor:'SocID',socid_link:'SocID Link',
+  // other scraper sub-sources
+  semantic_scholar:'Semantic Scholar',openalex:'OpenAlex',orcid:'ORCID',
+  wayback:'Wayback',gdelt:'GDELT',crtsh:'crt.sh',pgp:'PGP',gravatar:'Gravatar',
+};
 
 // State
 let captured=null, searchId=null, es=null, curSid=null;
@@ -2838,6 +2982,16 @@ function addLiveFeedItems(items){
 
 function handleEvent(m,name){
   if(m.type==='log'){addLogEntry(m);return;}
+  // PERF: preliminary results — render ranked hits early while reverse_face
+  // (the slow face engine) is still running. The final 'done' event re-renders
+  // with face verification and overwrites this. Stream stays open.
+  if(m.step==='partial'){
+    setStatus('busy',m.msg||'Preliminary results — face search still running…');
+    buildResults(m,name);
+    const _trr=document.getElementById('tr-res'); if(_trr) _trr.style.display='';
+    switchTab('res');
+    return;
+  }
   if(m.msg) setStatus('busy',m.msg);
   if(m.step&&m.step!=='done'&&m.step!=='error'){
     if(m.done_step) markStep(m.step,'ok',m.msg,'✓');
@@ -2968,6 +3122,21 @@ function _platName(url){
   if(u.includes('stackoverflow')) return 'Stack Overflow';
   try{ return new URL(url).hostname.replace('www.',''); }catch(e){ return 'Web'; }
 }
+function _srcIcon(src){
+  if(!src) return '🌐';
+  if(src.startsWith('playwright')) return '🎭';
+  if(src.startsWith('serpapi'))   return '🔑';
+  if(src.startsWith('yandex'))    return '🔍';
+  if(src==='pimeyes')             return '👁';
+  if(src==='sherlock')            return '🔎';
+  if(src==='direct_check')       return '✓';
+  if(src.startsWith('socid'))    return '🔗';
+  if(src==='cse_image'||src==='cse_social') return '🔍';
+  if(src.startsWith('cse'))      return '🔍';
+  if(src==='gravatar')            return '👤';
+  return '🌐';
+}
+
 function _matchCard(m, idx){
   const url = m.url||m.profile_url||'';
   const name = m.name||m.title||'';
@@ -3010,8 +3179,9 @@ function _matchCard(m, idx){
         <div class="mc-top">
           <span class="mc-plat">${icon} ${esc(platform)}</span>
           ${fv ? '<span class="mc-fv">&#10003; Face</span>' : ''}
+          ${m.playwright_verified ? '<span class="mc-pw">🎭 Verified</span>' : ''}
           ${mvc ? `<span class="vb ${mvc}" style="font-size:8px">${esc(mv.toUpperCase())}</span>` : ''}
-          <span class="mc-src">${esc(src.replace(/_/g,' '))}</span>
+          <span class="mc-src">${_srcIcon(src)} ${esc(SLBL[src]||src.replace(/_/g,' '))}</span>
         </div>
         ${name ? `<div class="mc-name">${esc(name)}</div>` : ''}
         ${meta ? `<div class="mc-meta">${meta}</div>` : ''}
@@ -3562,6 +3732,79 @@ function _cicPlayAlarm() {
 }
 
 // ── Slot management ────────────────────────────────────────────────────────
+function cicUploadVideo(slot) {
+  var inp = document.getElementById('cic-vid-' + slot);
+  if (inp) inp.click();
+}
+
+function cicHandleVideoFile(inp, slot) {
+  var file = inp.files[0];
+  inp.value = '';
+  if (file) _cicUploadAndStart(slot, file);
+}
+
+function _cicUploadAndStart(slot, file) {
+  var prog = document.getElementById('cic-prog-' + slot);
+  if (typeof toast === 'function') toast('Uploading ' + file.name + '…', 'ok');
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/crowd/api/slot/' + slot + '/upload');
+  if (prog) {
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) prog.style.width = Math.round(e.loaded / e.total * 100) + '%';
+    };
+  }
+  xhr.onload = function() {
+    if (prog) prog.style.width = '0%';
+    var d;
+    try { d = JSON.parse(xhr.responseText); } catch(e) { d = {}; }
+    if (d.ok) {
+      _cicActiveSlots.add(slot);
+      var tile = document.getElementById('cic-tile-' + slot);
+      var dot  = document.getElementById('cic-dot-' + slot);
+      if (tile) tile.classList.remove('offline');
+      if (dot)  dot.className = 'cic-status-dot live';
+      if (typeof toast === 'function') toast('Slot ' + slot + ': ' + (d.filename || file.name), 'ok');
+    } else {
+      if (typeof toast === 'function') toast('Cannot open video: ' + (d.error || 'unknown'), 'er');
+    }
+  };
+  xhr.onerror = function() {
+    if (prog) prog.style.width = '0%';
+    if (typeof toast === 'function') toast('Upload error', 'er');
+  };
+  var fd = new FormData();
+  fd.append('video', file);
+  xhr.send(fd);
+}
+
+function _cicSetupDragDrop() {
+  for (var s = 0; s < 4; s++) {
+    (function(slot) {
+      var tile = document.getElementById('cic-tile-' + slot);
+      if (!tile) return;
+      tile.addEventListener('dragover', function(e) {
+        e.preventDefault(); e.stopPropagation();
+        tile.classList.add('drag-over');
+      });
+      tile.addEventListener('dragleave', function(e) {
+        if (!tile.contains(e.relatedTarget)) tile.classList.remove('drag-over');
+      });
+      tile.addEventListener('drop', function(e) {
+        e.preventDefault(); e.stopPropagation();
+        tile.classList.remove('drag-over');
+        var files = e.dataTransfer.files;
+        if (!files.length) return;
+        var file = files[0];
+        if (!file.type.startsWith('video/')) {
+          if (typeof toast === 'function') toast('Drop a video file (.mp4, .avi, .mov…)', 'er');
+          return;
+        }
+        _cicUploadAndStart(slot, file);
+      });
+    })(s);
+  }
+}
+
 function cicStartSlot(slot) {
   var dataDir = 'Place your video in data\\ folder (e.g. data\\crowd.mp4)';
   var src = prompt(
@@ -3684,40 +3927,62 @@ function _cicUpdateZonePoly(zid, risk) {
 function cicToggleHeatmap() {
   _cicHeatOn = !_cicHeatOn;
   var btn = document.getElementById('map-toggle-heat');
-  if (btn) btn.textContent = (_cicHeatOn ? 'Heat Map ON' : 'Heat Map OFF');
-  if (_cicHeatOn) {
-    _cicUpdateHeatmap();
-    _cicHeatTimer = setInterval(_cicUpdateHeatmap, 2000);
-  } else {
+  var st  = document.getElementById('cic-heat-status');
+  if (btn) {
+    btn.innerHTML = '&#127777; Heat Map ' + (_cicHeatOn ? '<b>ON</b>' : 'OFF');
+    btn.classList.toggle('heat-on', _cicHeatOn);
+  }
+  if (!_cicHeatOn) {
     if (_cicHeatTimer) { clearInterval(_cicHeatTimer); _cicHeatTimer = null; }
     if (_cicHeatLayer && _cicMapObj) { _cicMapObj.removeLayer(_cicHeatLayer); _cicHeatLayer = null; }
+    if (st) st.textContent = '';
+  } else {
+    _cicUpdateHeatmap();
+    _cicHeatTimer = setInterval(_cicUpdateHeatmap, 2000);
   }
 }
 
 function _cicUpdateHeatmap() {
   if (!_cicMapObj || typeof L === 'undefined') return;
+  var st = document.getElementById('cic-heat-status');
   fetch('/crowd/api/heatmap').then(function(r) { return r.json(); }).then(function(d) {
     var pts = d.points || [];
-    if (_cicHeatLayer) _cicMapObj.removeLayer(_cicHeatLayer);
-    if (typeof L.heatLayer === 'undefined') {
-      // Load Leaflet.heat plugin dynamically
-      var s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js';
-      s.onload = function() {
-        _cicHeatLayer = L.heatLayer(pts, {radius:25, blur:20, maxZoom:17, max:1.0,
-          gradient:{0.0:'blue',0.3:'lime',0.6:'yellow',0.8:'orange',1.0:'red'}}).addTo(_cicMapObj);
-      };
-      document.head.appendChild(s);
-    } else {
-      _cicHeatLayer = L.heatLayer(pts, {radius:25, blur:20, maxZoom:17,
+    // Status label
+    if (st) {
+      if (pts.length === 0)
+        st.innerHTML = '<span style="color:var(--yellow)">&#9888; No camera active — start a slot to see heat data</span>';
+      else
+        st.textContent = pts.length + ' point' + (pts.length !== 1 ? 's' : '');
+    }
+    if (!_cicMapObj) return;
+    if (_cicHeatLayer) { try { _cicMapObj.removeLayer(_cicHeatLayer); } catch(e){} _cicHeatLayer = null; }
+    if (pts.length === 0) return;
+    function _renderHeat() {
+      if (!_cicMapObj) return;
+      _cicHeatLayer = L.heatLayer(pts, {radius:25, blur:20, maxZoom:17, max:1.0,
         gradient:{0.0:'blue',0.3:'lime',0.6:'yellow',0.8:'orange',1.0:'red'}}).addTo(_cicMapObj);
     }
-  }).catch(function() {});
+    if (typeof L.heatLayer === 'undefined') {
+      if (document.getElementById('leaflet-heat-js')) return; // already loading
+      var s = document.createElement('script');
+      s.id  = 'leaflet-heat-js';
+      s.src = 'https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js';
+      s.onload = _renderHeat;
+      document.head.appendChild(s);
+    } else {
+      _renderHeat();
+    }
+  }).catch(function() {
+    if (st) st.innerHTML = '<span style="color:var(--red)">Heat map fetch failed</span>';
+  });
 }
 
 function cicRefreshMap() {
+  if (_cicHeatTimer) { clearInterval(_cicHeatTimer); _cicHeatTimer = null; }
+  _cicHeatLayer = null; // stale reference from old map instance
   if (_cicMapObj) { _cicMapObj.remove(); _cicMapObj = null; _cicZonePolys = {}; }
   _cicInitMap();
+  if (_cicHeatOn) { _cicUpdateHeatmap(); _cicHeatTimer = setInterval(_cicUpdateHeatmap, 2000); }
 }
 
 // ── Chart.js Analytics ─────────────────────────────────────────────────────
@@ -3944,6 +4209,7 @@ toggleCIC = function() {
 };
 
 loadHistory();
+_cicSetupDragDrop();
 </script>
 </body>
 </html>"""

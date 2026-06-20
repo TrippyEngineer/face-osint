@@ -1,7 +1,10 @@
+import asyncio
 import base64
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -565,6 +568,246 @@ def _enrich(match: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 6 — Playwright Google Lens (free, no API key, no image hosting)
+# ══════════════════════════════════════════════════════════════════════════
+def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
+    """
+    Google Lens via headless Chromium. No SerpApi key needed.
+    Uses Google Images camera icon → expect_file_chooser() to intercept the
+    native OS file dialog, then parses the visual match results page.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.info("playwright not installed — skipping Lens (pip install playwright && playwright install chromium)")
+        return [], []
+
+    matches, names, seen = [], [], set()
+    tmp_path = None
+    # Give each thread its own event loop so parallel invocations don't conflict
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(img_bytes)
+            tmp_path = f.name
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(15000)
+
+            # Google Images homepage → click camera icon (visual search)
+            page.goto("https://images.google.com/", timeout=15000, wait_until="domcontentloaded")
+            page.click('[aria-label="Search by image"]', timeout=8000)
+            page.wait_for_timeout(800)
+
+            # Intercept the native OS file dialog that "upload a file" triggers
+            with page.expect_file_chooser(timeout=8000) as fc_info:
+                page.get_by_role("button", name="upload a file").click(timeout=6000)
+            fc_info.value.set_files(tmp_path)
+
+            # Wait for results page
+            page.wait_for_url("**search**", timeout=25000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+
+            # Collect all external result links
+            for a in page.locator("a[href]").all()[:120]:
+                try:
+                    href = a.get_attribute("href") or ""
+                    if (
+                        href.startswith("http")
+                        and "google.com" not in href
+                        and "gstatic.com" not in href
+                        and href not in seen
+                    ):
+                        seen.add(href)
+                        title, thumb = "", None
+                        try:
+                            title = a.inner_text(timeout=400).strip()[:120]
+                        except Exception:
+                            pass
+                        try:
+                            src = a.locator("img").first.get_attribute("src", timeout=400)
+                            if src and src.startswith("http"):
+                                thumb = src
+                        except Exception:
+                            pass
+                        matches.append({
+                            "url":       href,
+                            "title":     title,
+                            "photo_url": thumb,
+                            "platform":  _platform(href),
+                            "source":    "playwright_google_lens",
+                        })
+                except Exception:
+                    continue
+
+            # Knowledge panel entity name (skip generic UI labels)
+            _SKIP = {"ai overview", "more images", "search results", "all results", "images"}
+            for sel in [
+                '[data-attrid="title"] span',
+                ".kno-ecr-pt span",
+                ".dAassd span",
+                '[aria-level="2"]',
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=800):
+                        nm = el.inner_text(timeout=400).strip()
+                        if (nm and 2 <= len(nm.split()) <= 5
+                                and nm not in names
+                                and nm.lower() not in _SKIP):
+                            names.append(nm)
+                            logger.info(f"Playwright Lens entity: '{nm}'")
+                            break
+                except Exception:
+                    continue
+
+            browser.close()
+
+    except Exception as e:
+        logger.warning(f"Playwright Google Lens: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    logger.info(f"Playwright Google Lens: {len(matches)} candidates, names={names}")
+    return matches, names
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENGINE 7 — Playwright Bing Visual Search (free, complements Google Lens)
+# ══════════════════════════════════════════════════════════════════════════
+def _playwright_bing_visual(img_bytes: bytes) -> tuple[list[dict], list[str]]:
+    """
+    Bing Visual Search via headless Chromium. No API key needed.
+    Different index from Google — useful for Eastern Europe / Central Asia / India.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return [], []
+
+    matches, names, seen = [], [], set()
+    tmp_path = None
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(img_bytes)
+            tmp_path = f.name
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(15000)
+
+            # Bing Images → camera icon → upload panel → file chooser
+            page.goto("https://www.bing.com/images", timeout=15000, wait_until="domcontentloaded")
+            page.get_by_role("button", name="Search using an image").click(timeout=6000)
+            page.wait_for_timeout(600)
+
+            # Intercept native file dialog from "upload an image" button
+            with page.expect_file_chooser(timeout=8000) as fc_info:
+                page.get_by_role("button", name="upload an image").click(timeout=6000)
+            fc_info.value.set_files(tmp_path)
+
+            page.wait_for_load_state("networkidle", timeout=20000)
+
+            # Bing result cards — each <a m='{"purl":"...","murl":"..."}'>
+            for a in page.locator("a[m]").all()[:80]:
+                try:
+                    m_attr = a.get_attribute("m") or "{}"
+                    m_data = json.loads(m_attr)
+                    actual_url = m_data.get("purl") or m_data.get("murl") or ""
+                    if actual_url and "bing.com" not in actual_url and actual_url not in seen:
+                        seen.add(actual_url)
+                        title = (a.get_attribute("title") or "").strip()[:120]
+                        thumb = m_data.get("turl") or None
+                        matches.append({
+                            "url":       actual_url,
+                            "title":     title,
+                            "photo_url": thumb,
+                            "platform":  _platform(actual_url),
+                            "source":    "playwright_bing_visual",
+                        })
+                except Exception:
+                    continue
+
+            # Fallback: collect plain href links if m-attribute cards are absent
+            if not matches:
+                for a in page.locator("a[href]").all()[:80]:
+                    try:
+                        href = a.get_attribute("href") or ""
+                        if href.startswith("http") and "bing.com" not in href and href not in seen:
+                            seen.add(href)
+                            title = (a.get_attribute("title") or a.inner_text(timeout=300) or "").strip()[:120]
+                            matches.append({
+                                "url": href, "title": title,
+                                "platform": _platform(href), "source": "playwright_bing_visual",
+                            })
+                    except Exception:
+                        continue
+
+            # Bing entity panel
+            for sel in [".b_entityTitle", ".va_title h1", "[class*='entity'] h1"]:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=800):
+                        nm = el.inner_text(timeout=400).strip()
+                        if nm and 2 <= len(nm.split()) <= 5 and nm not in names:
+                            names.append(nm)
+                            logger.info(f"Playwright Bing entity: '{nm}'")
+                            break
+                except Exception:
+                    continue
+
+            browser.close()
+
+    except Exception as e:
+        logger.warning(f"Playwright Bing Visual: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    logger.info(f"Playwright Bing Visual: {len(matches)} candidates, names={names}")
+    return matches, names
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════
 def scrape(context: dict) -> dict:
@@ -595,20 +838,25 @@ def scrape(context: dict) -> dict:
     all_candidates: list[dict] = []
     detected_names: list[str]  = []
 
-    # All 4 engines in parallel
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        f_sl = pool.submit(_serpapi_lens,   public_url)
-        f_sy = pool.submit(_serpapi_yandex, public_url)
-        f_yd = pool.submit(_yandex_direct,  img_bytes)
-        f_cse= pool.submit(_google_cse,     name_hint, public_url)
+    # All engines in parallel — Playwright engines (6 + 7) run alongside existing ones.
+    # NOTE: _yandex_direct (keyless CBIR upload) was dropped — Yandex anti-bot blocks
+    # it ("both block names failed"), so it only added latency with zero results.
+    # SerpApi Yandex (_serpapi_yandex) is kept; it's a clean no-op without SERPAPI_KEY.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        f_sl  = pool.submit(_serpapi_lens,          public_url)
+        f_sy  = pool.submit(_serpapi_yandex,        public_url)
+        f_cse = pool.submit(_google_cse,            name_hint, public_url)
+        f_pl  = pool.submit(_playwright_google_lens, img_bytes)
+        f_pb  = pool.submit(_playwright_bing_visual, img_bytes)
 
         sl_res, sl_names = f_sl.result()
         sy_res, sy_names = f_sy.result()
-        yd_res, yd_names = f_yd.result()
-        cse_res          = f_cse.result()
+        cse_res           = f_cse.result()
+        pl_res, pl_names  = f_pl.result()
+        pb_res, pb_names  = f_pb.result()
 
-    all_candidates += sl_res + sy_res + yd_res + cse_res
-    detected_names  += sl_names + sy_names + yd_names
+    all_candidates += sl_res + sy_res + cse_res + pl_res + pb_res
+    detected_names  += sl_names + sy_names + pl_names + pb_names
 
     # Engine 5 — PimEyes (paid, silently skipped if key not set)
     try:

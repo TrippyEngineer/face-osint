@@ -29,6 +29,7 @@ import logging
 import subprocess
 import tempfile
 import shutil
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait as fut_wait
 from typing import Optional
@@ -82,11 +83,18 @@ def _sherlock(variants: list[str], timeout_s: int = 45) -> list[dict]:
     """
     sherlock_cmd = shutil.which("sherlock")
     if not sherlock_cmd:
-        # Try running as python module
-        result = subprocess.run(
-            [sys.executable, "-m", "sherlock_project.sherlock", "--version"],
-            capture_output=True, timeout=5,
-        )
+        # Try running as python module — guard the check itself: under high
+        # concurrency the cold import of sherlock_project (300+ site defs) can
+        # exceed the timeout, and an uncaught TimeoutExpired here would crash the
+        # whole username scraper (observed once SCRAPER_MAX_WORKERS was raised).
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "sherlock_project.sherlock", "--version"],
+                capture_output=True, timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.info(f"sherlock-project version check failed ({type(e).__name__}) — skipping Layer 1")
+            return []
         if result.returncode != 0:
             logger.info("sherlock-project not installed — skipping Layer 1")
             logger.info("  → pip install sherlock-project")
@@ -281,12 +289,183 @@ def _direct_checks(variants: list[str]) -> list[dict]:
     return deduped
 
 
+# ── Layer 4: Playwright — JS-gated profile verification + enrichment ─────
+_JS_GATED_PLATFORMS = {
+    "Instagram", "TikTok", "YouTube", "Pinterest", "Spotify", "Telegram", "Twitch"
+}
+
+_NOT_FOUND_PHRASES = [
+    "this page isn't available",
+    "sorry, this page",
+    "couldn't find this account",
+    "page not found",
+    "user not found",
+    "doesn't exist",
+    "not available",
+    "no results found",
+    "profile not found",
+]
+
+def _playwright_verify_js_profiles(candidates: list[dict], deadline: float = 0.0) -> list[dict]:
+    """
+    Layer 4: Re-verify JS-gated platforms where plain HTTP lies.
+    Instagram/TikTok/YouTube etc. return HTTP 200 with JS-rendered "not found" pages
+    that requests.get can't see reliably. Playwright renders the real page.
+
+    Drops confirmed false positives. Enriches confirmed hits with name/bio/avatar.
+    Platforms not in _JS_GATED_PLATFORMS pass through unchanged.
+    """
+    js_hits = [m for m in candidates if m.get("platform") in _JS_GATED_PLATFORMS]
+    if not js_hits:
+        return candidates
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.info("playwright not installed — skipping JS profile verification")
+        return candidates
+
+    verified: dict[str, bool] = {}   # url → True=exists, False=not found
+    enriched: dict[str, dict] = {}   # url → {name, bio, photo_url}
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = browser.new_context(
+                user_agent=config.BROWSER_HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 900},
+            )
+
+            for m in js_hits[:10]:  # cap to stay within the scraper budget
+                # PERF: stop launching page checks once over the total budget.
+                # Each goto+networkidle below costs ~9s; verifying all candidates
+                # is what ran username to 140s+. The orchestrator abandons us at
+                # 50s regardless, so anything past the deadline is wasted work.
+                if deadline and time.time() >= deadline:
+                    logger.info("username Layer 4: stopping JS verify — over time budget")
+                    break
+                url      = m.get("url", "")
+                platform = m.get("platform", "")
+                if not url:
+                    continue
+                page = ctx.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=6000)
+                    page.wait_for_load_state("networkidle", timeout=3000)
+                    content = page.content().lower()
+
+                    exists = not any(p in content for p in _NOT_FOUND_PHRASES)
+                    verified[url] = exists
+
+                    if exists:
+                        extra = {}
+                        # Platform-specific data extraction from JSON blobs in <script> tags
+                        if platform == "Instagram":
+                            for script in page.locator('script[type="application/json"]').all():
+                                try:
+                                    raw = script.inner_text(timeout=400)
+                                    if '"username"' not in raw:
+                                        continue
+                                    data = json.loads(raw)
+                                    # Instagram buries profile data in nested dicts
+                                    def _dig(obj, keys):
+                                        for k in keys:
+                                            if isinstance(obj, dict) and k in obj:
+                                                return obj[k]
+                                        if isinstance(obj, dict):
+                                            for v in obj.values():
+                                                r = _dig(v, keys)
+                                                if r:
+                                                    return r
+                                        return ""
+                                    extra["name"]      = _dig(data, ["full_name", "fullName"])
+                                    extra["bio"]       = _dig(data, ["biography", "bio"])
+                                    extra["photo_url"] = _dig(data, ["profile_pic_url_hd", "profilePicUrl", "profile_pic_url"])
+                                    break
+                                except Exception:
+                                    continue
+
+                        elif platform == "TikTok":
+                            try:
+                                raw = page.locator("#SIGI_STATE").inner_text(timeout=1000)
+                                data = json.loads(raw)
+                                users = data.get("UserModule", {}).get("users", {})
+                                if users:
+                                    u = next(iter(users.values()))
+                                    extra["name"]      = u.get("nickname", "")
+                                    extra["bio"]       = u.get("signature", "")
+                                    extra["photo_url"] = u.get("avatarLarger", "")
+                            except Exception:
+                                pass
+
+                        elif platform == "YouTube":
+                            # og:title contains channel name
+                            try:
+                                t = page.locator('meta[property="og:title"]').get_attribute("content", timeout=800)
+                                if t:
+                                    extra["name"] = t.strip()
+                            except Exception:
+                                pass
+
+                        if extra:
+                            enriched[url] = extra
+
+                except Exception as e:
+                    logger.debug(f"Playwright verify {url}: {e}")
+                    verified.setdefault(url, True)  # assume exists on error (don't drop)
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+
+            browser.close()
+
+    except Exception as e:
+        logger.warning(f"Playwright profile verify: {e}")
+        return candidates  # fallback: return original list unchanged
+
+    # Rebuild candidate list — drop confirmed non-existent, enrich confirmed hits
+    kept, dropped = [], 0
+    for m in candidates:
+        url = m.get("url", "")
+        if url in verified:
+            if not verified[url]:
+                dropped += 1
+                continue
+            if url in enriched:
+                for k, v in enriched[url].items():
+                    if v:
+                        m.setdefault(k, v)
+            m["playwright_verified"] = True
+        kept.append(m)
+
+    logger.info(
+        f"Playwright verify: {len(js_hits)} JS-gated profiles checked, "
+        f"{dropped} false positives removed, {len(enriched)} enriched"
+    )
+    return kept
+
+
 # ── Main scrape entry point ───────────────────────────────────────────────
 def scrape(context: dict) -> dict:
     """
     Called by the SCRAPER dispatcher in app.py.
     Returns standard {source, matches} dict.
     """
+    # PERF: total wall-clock budget. run_search gives this scraper a 50s deadline;
+    # without an internal budget the layers below (socid enrichment, Playwright)
+    # ran the thread to ~156s in the background. Run fast→slow and skip the slow
+    # layers once the budget is spent so the scraper self-terminates near deadline.
+    BUDGET_S  = 40   # under the 50s orchestrator deadline, leaving margin for one
+                     # in-flight Layer-4 page load so the scraper self-terminates
+    t0        = time.time()
+    deadline  = t0 + BUDGET_S
+    remaining = lambda: deadline - time.time()
+
     name       = context["name"]
     variants   = _variants(name)
     all_matches: list[dict] = []
@@ -298,18 +477,24 @@ def scrape(context: dict) -> dict:
     direct = _direct_checks(variants)
     all_matches.extend(direct)
 
-    # Layer 1: Sherlock (if installed) — hard timeout 15s to prevent pipeline stall
-    sherlock_results = _sherlock(variants, timeout_s=15)
-    # Merge Sherlock results, skip duplicates already found in direct
-    seen_urls = {m["url"] for m in all_matches}
-    for m in sherlock_results:
-        if m["url"] not in seen_urls:
-            seen_urls.add(m["url"])
-            all_matches.append(m)
+    # Layer 1: Sherlock — cap by remaining budget (subprocess is killed at timeout)
+    if remaining() > 5:
+        sherlock_results = _sherlock(variants, timeout_s=min(15, int(remaining())))
+        # Merge Sherlock results, skip duplicates already found in direct
+        seen_urls = {m["url"] for m in all_matches}
+        for m in sherlock_results:
+            if m["url"] not in seen_urls:
+                seen_urls.add(m["url"])
+                all_matches.append(m)
+    else:
+        logger.info("username: skipping Sherlock — over time budget")
 
-    # Layer 2: socid_extractor enrichment on top 8 found URLs
+    # Layer 2: socid_extractor enrichment on top 8 found URLs — stop at deadline
     enriched_extra: list[dict] = []
     for m in all_matches[:8]:
+        if remaining() <= 2:
+            logger.info("username: stopping socid enrichment — over time budget")
+            break
         socid = _socid_enrich(m["url"])
         if socid:
             m["socid"] = socid
@@ -342,8 +527,14 @@ def scrape(context: dict) -> dict:
             seen_urls.add(m["url"])
             all_matches.append(m)
 
+    # Layer 4: Playwright JS-profile verification — slowest layer; skip if budget spent
+    if remaining() > 5:
+        all_matches = _playwright_verify_js_profiles(all_matches, deadline=deadline)
+    else:
+        logger.info("username: skipping Layer 4 playwright verify — over time budget")
+
     logger.info(
-        f"Username OSINT complete: "
+        f"Username OSINT complete in {time.time()-t0:.1f}s: "
         f"{len(all_matches)} total accounts, "
         f"{len(socid_data)} socid enrichments, "
         f"variants={variants}"

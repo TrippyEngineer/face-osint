@@ -127,6 +127,24 @@ def extract_from_url(url: str) -> Optional[np.ndarray]:
         return None
 
 
+def prewarm() -> None:
+    """
+    Load the Facenet512 model into memory ahead of the first search.
+
+    PERF: the first extract() call pays a ~30-40s cold-start (TensorFlow init +
+    Facenet512 weight load). Calling this once in a background thread at app
+    startup moves that cost off the user's first search. DeepFace caches the
+    model internally, so the subsequent real extract() is fast. Safe no-op on
+    failure — extract() still loads lazily.
+    """
+    try:
+        from deepface import DeepFace
+        DeepFace.build_model(config.DEEPFACE_MODEL)
+        logger.info(f"DeepFace model pre-warmed: {config.DEEPFACE_MODEL}")
+    except Exception as e:
+        logger.warning(f"DeepFace pre-warm failed (will load lazily on first search): {e}")
+
+
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """
     Cosine similarity between two L2-normalised embeddings.

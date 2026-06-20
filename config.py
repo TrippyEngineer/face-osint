@@ -75,7 +75,13 @@ FACE_REJECTED   = 0.35   # different person — discard
 # ║  SCRAPER BEHAVIOUR                                                   ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 SCRAPER_TIMEOUT_S   = 20     # max seconds per scraper before it is abandoned
-SCRAPER_MAX_WORKERS = 4      # max parallel scrapers (keep low for limited RAM)
+# = number of scrapers (run_search dispatches 7) so none queue. Queueing was the
+# bug: with 4 workers the last-submitted scrapers (username/passive) started ~20s
+# late, so their per-scraper deadline (measured from scraping start) expired while
+# they were still queued and their results were discarded. Mostly I/O-bound; the
+# two heavy ones (reverse_face, username) each spawn a browser, so peak is ~3
+# headless chromium — fine on any machine that already runs the DeepFace/YOLO stack.
+SCRAPER_MAX_WORKERS = 7      # one worker per scraper — no queueing, deadlines accurate
 HTTP_TIMEOUT_S      = 12     # per HTTP request timeout
 HTTP_RETRIES        = 2      # retry transient failures this many times
 
