@@ -1,40 +1,41 @@
-## Face OSINT — run: pip install -r requirements.txt
-## Python 3.10 or 3.11 recommended (3.12 breaks TensorFlow 2.16)
+## Face OSINT + Crowd Intelligence Center
+## Python 3.10 or 3.11 required — TensorFlow 2.16 does not support 3.12
+## Install: pip install -r requirements.txt
 
-## Core web framework
+# ── Web framework ───────────────────────────────────────────────────────────
 flask
 flask-cors
 requests
 python-dotenv
 
-## HTML parsing
+# ── HTML parsing ─────────────────────────────────────────────────────────────
 beautifulsoup4
 lxml
 
-## Image & camera
+# ── Image & camera ───────────────────────────────────────────────────────────
 opencv-python
 numpy
 Pillow
 
-## Face recognition (downloads ~600MB models on first run)
+# ── Face recognition ─────────────────────────────────────────────────────────
+# Downloads ~600 MB Facenet512 weights to data/models/ on first run.
 deepface
 tensorflow
+tf-keras          # required by TensorFlow 2.16+
 
-## String similarity for entity resolution (optional but strongly recommended)
-## Falls back to a slower pure-Python implementation if not installed
+# ── Fuzzy string matching (entity resolution) ────────────────────────────────
+# Falls back to a slower pure-Python implementation if absent.
 rapidfuzz
 
-## Username OSINT tools (optional — Layer 1 and Layer 2 in username.py)
-## Install these for better username coverage:
-##   pip install sherlock-project socid-extractor
-# sherlock-project
-# socid-extractor
-
-## Reddit with authentication (optional — falls back to public JSON without it)
-# praw
-
-## Crowd Intelligence Center (CIC) — install for full functionality
-## YOLOv8n person detection (auto-downloads 6MB model on first run)
+# ── Crowd Intelligence Center (CIC) ─────────────────────────────────────────
+# Core CIC features — required for the ⚡ CIC mode.
+#   YOLOv8n: auto-downloads 6 MB model on first run; person detection at ~5 FPS on CPU.
+#   anthropic: Claude API streaming operator assistant (set ANTHROPIC_API_KEY in .env).
 ultralytics>=8.0
-## Claude API for LLM operator assistant (set ANTHROPIC_API_KEY in .env)
 anthropic>=0.25
+
+# ── Optional OSINT extras ─────────────────────────────────────────────────────
+# Uncomment to enable; the system works without them.
+# sherlock-project   # username OSINT — 300+ platforms (vs 125 built-in direct checks)
+# socid-extractor    # social ID extraction from profile pages
+# praw               # authenticated Reddit API (falls back to public JSON without it)

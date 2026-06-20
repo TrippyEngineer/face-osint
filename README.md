@@ -1,34 +1,174 @@
 <div align="center">
 
-# Face OSINT
+# Face OSINT + Crowd Intelligence Center
 
-**Capture a face. Get an identity.**
+**Capture a face. Identify an individual. Command a crowd.**
 
-Point your camera at someone, upload a photo, or stream from a phone —  
-Face OSINT searches 10+ open-source intelligence sources simultaneously,  
-face-verifies every result, and delivers a ranked, de-duplicated identity profile in under two minutes.
+Two systems in one: a deep OSINT identity pipeline powered by face recognition,
+and a real-time AI crowd management platform modeled on India's ICCC deployments at Kumbh Mela scale.
 
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Flask](https://img.shields.io/badge/Flask-SSE%20Web%20UI-000000?style=flat-square&logo=flask&logoColor=white)](https://flask.palletsprojects.com)
+[![Flask](https://img.shields.io/badge/Flask-SSE%20Live%20UI-000000?style=flat-square&logo=flask&logoColor=white)](https://flask.palletsprojects.com)
+[![YOLOv8](https://img.shields.io/badge/YOLOv8n-Person%20Detection-00B4D8?style=flat-square)](https://docs.ultralytics.com)
 [![DeepFace](https://img.shields.io/badge/DeepFace-Facenet512-FF6B6B?style=flat-square)](https://github.com/serengil/deepface)
+[![Claude](https://img.shields.io/badge/Claude%20API-LLM%20Operator-8B5CF6?style=flat-square)](https://anthropic.com)
+[![Leaflet](https://img.shields.io/badge/Leaflet.js-GIS%20Heat%20Map-199900?style=flat-square&logo=leaflet&logoColor=white)](https://leafletjs.com)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL%20Mode-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org)
 [![License](https://img.shields.io/badge/License-Research%20%2F%20Educational-yellow?style=flat-square)](#responsible-use)
 
-**No Docker. No Redis. No cloud accounts. No API keys required to start.**  
-Runs entirely on your local machine with a single `pip install`.
+**No Docker. No Redis. No cloud accounts. Runs on a laptop.**  
+Single `pip install` → `python app.py` → browser opens.
 
-> **This project is for research and educational purposes only.**
+> This project is for research and educational purposes only.
 
 </div>
 
 ---
 
-## Pipeline Overview
+## Two Modes, One Application
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    localhost:5000                         │
+│                                                          │
+│  [ Face OSINT ]  ──────────  [ ⚡ CIC ]                  │
+│                                                          │
+│  Identity search             Crowd management            │
+│  Face recognition            Real-time surveillance      │
+│  OSINT scraping              AI operator interface       │
+│  Entity resolution           GIS density heat maps       │
+└──────────────────────────────────────────────────────────┘
+```
+
+Click **[CIC]** in the top bar to switch into Crowd Intelligence Center mode.
+Click **[Face OSINT]** to return to identity investigation mode.
+Both run on the same Flask server, same camera infrastructure, same SQLite database.
+
+---
+
+## Crowd Intelligence Center (CIC)
+
+A laptop-scale depiction of an Integrated Command and Control Centre (ICCC) as deployed at India's Maha Kumbh Mela and similar mega-events. Real detection algorithms. Real risk scoring. Real LLM-powered operator interface.
+
+### Live Architecture
+
+```mermaid
+flowchart LR
+    subgraph CAMERAS["Camera Inputs (4 slots)"]
+        C0["Slot 0\nWebcam / IP cam"]
+        C1["Slot 1\nVideo clip / RTSP"]
+        C2["Slot 2\nVideo clip / RTSP"]
+        C3["Slot 3\nVideo clip / RTSP"]
+    end
+
+    subgraph AI["Per-Camera AI Pipeline  ·  crowd/analyzer.py"]
+        direction TB
+        YOLO["YOLOv8n\nPerson detection\n5 FPS · CPU · 6MB"]
+        TRACK["ByteTrack\nPersistent IDs\ntrajectory history"]
+        FLOW["Farneback\nOptical flow\ndirection + speed"]
+        BEH["Behavioral AI\nLoitering · Running\nChildren · Suspicious"]
+        RISK["Zone Density\npersons / m²\nSAFE→CAUTION→CRITICAL"]
+        YOLO --> TRACK --> BEH
+        FLOW --> BEH
+        BEH --> RISK
+    end
+
+    subgraph PLAT["Platform Aggregator  ·  crowd/platform.py"]
+        AGG["Metric fusion\n1 Hz broadcast\nAlert generation"]
+        HIST["5-min rolling\nhistory per zone\nChart.js trend"]
+        SSE["Server-Sent Events\nLive push to all\nbrowser tabs"]
+        AGG --> HIST --> SSE
+    end
+
+    subgraph UI["Dashboard UI  ·  5 tabs"]
+        CAM["Live Cameras\n2×2 grid + overlay\ntoggle controls"]
+        MAP["Zone Map\nLeaflet GIS\nDensity heat map"]
+        ALERT["Alerts & SOPs\nLLM operator\nAcknowledgement"]
+        CHART["Analytics\nBar + trend charts\nOccupancy history"]
+        LOST["Khoya-Paya\nLost person search\nFace match from DB"]
+    end
+
+    CAMERAS --> AI --> PLAT --> UI
+```
+
+### Features — Real Deployment Grade
+
+| Feature | What it does |
+|---|---|
+| **YOLOv8n Detection** | 5 FPS person detection on CPU; 6MB model auto-downloads; 8–15 persons/frame typical |
+| **ByteTrack Tracking** | Persistent ID assignment across frames; trajectory history per person |
+| **Optical Flow** | OpenCV Farneback every 5th frame; dominant direction vector shown as arrow overlay |
+| **Behavioral AI** | Loitering (25 frames < 8px movement), running (velocity > 12px/frame), children (bbox height < 22% frame) |
+| **Zone Density** | `count / area_m²` → SAFE / CAUTION / HIGH / CRITICAL risk with per-zone thresholds |
+| **GIS Heat Map** | Leaflet.js map with person-position heat layer; updates every 2s |
+| **Zone Polygons** | Lat/lon zone boundaries with color fill reflecting live density risk |
+| **ICCC Dashboard** | 5-tab operator interface with live SSE push — no page refresh needed |
+| **LLM Operator** | Claude API streaming chat: "Which zones are critical and what should I do?" → structured SOP response |
+| **IP Camera** | Enter `192.168.x.x:8080` → auto-probes 4 common MJPEG endpoints |
+| **RTSP / Video** | Any `rtsp://` URL or `.mp4` / `.avi` file (loops); Windows paths supported |
+| **Overlay Toggles** | Per-slot toggle bar: Boxes · Track ID · Suspicious · Children · Flow Arrow · Count |
+| **Audio Alarm** | Web Audio API synthetic alarm on CRITICAL density; 30s cooldown; on/off toggle |
+| **Alert Dedup** | 60s cooldown per (zone, type) pair; alert log newest-first with severity badges |
+| **Analytics Charts** | Chart.js bar charts (zone occupancy) and line trend charts (5-min history) |
+| **Khoya-Paya** | Upload a photo → DeepFace cosine search across **two indexes**: (1) historical OSINT face vectors and (2) CIC crowd captures — returns name/track-ID, last-seen zone, camera slot, and timestamp |
+| **CIC Face Indexing** | Every tracked person's face crop is extracted every 60 s, upscaled to ≥ 160 px, and embedded via Facenet512 → stored in `cic_face_captures` SQLite table for Khoya-Paya retrieval |
+
+### Kumbh Mela Reference Zones
+
+The default `zones.json` models Prayagraj's Kumbh Mela grounds:
+
+| Zone | Camera Slot | Area | Capacity | CRITICAL at |
+|---|---|---|---|---|
+| Sangam Ghat | 0 | 8,000 m² | 50,000 | 48 persons/frame |
+| Pontoon Bridge | 1 | 2,000 m² | 8,000 | 12 persons/frame |
+| Sector 4 Entry Plaza | 2 | 12,000 m² | 80,000 | 72 persons/frame |
+| Approach Road | 3 | 5,000 m² | 30,000 | 30 persons/frame |
+
+### Starting the CIC
+
+```bash
+python app.py          # starts at localhost:5000
+```
+
+1. Click **[⚡ CIC]** in the top bar
+2. Click a camera tile → enter a source:
+   - `0` → webcam
+   - `data\crowd.mp4` → video file in the project `data\` folder
+   - `192.168.1.100:8080` → IP camera (auto-probes endpoints)
+   - `rtsp://user:pass@192.168.1.100/stream` → RTSP
+3. Frames appear immediately; YOLO detection kicks in after ~15–20s (model loads once and caches)
+4. Switch to **Zone Map** tab → click **Heat Map ON** to see live density overlay
+5. Switch to **Alerts & SOPs** tab → type a question in the chat to consult the AI operator
+
+### LLM Operator Interface
+
+The **Alerts & SOPs** tab has a live Claude-powered ICCC operator assistant:
+
+```
+You: Which zones are near critical and what actions should I take?
+
+AI: ## Current Crowd Status
+
+CAUTION: Sangam Ghat — 9 persons, 0.0011 p/m² (density rising)
+SAFE: Pontoon Bridge — 0 persons
+
+Recommended Actions:
+• Deploy 2 stewards to Sangam Ghat to manage crowd flow
+• Monitor Pontoon Bridge entry rate — current trajectory suggests
+  CAUTION threshold in ~8 minutes at current rate
+• Prepare SOP-2 (crowd diversion) for Sangam Ghat if density exceeds 2.0 p/m²
+```
+
+Put your `ANTHROPIC_API_KEY` in `.env` to enable this feature.
+
+---
+
+## Face OSINT Pipeline
 
 ```mermaid
 flowchart TD
     INPUT(["`**Input**
-    📷 Camera · 🖼 Photo · 📡 WiFi Cam`"])
+    Camera · Photo · WiFi Cam`"])
 
     EMB["`**Layer 1 — Embedding**
     DeepFace · Facenet512
@@ -39,45 +179,34 @@ flowchart TD
     Search history`")]
 
     SCRAPE["`**Layer 2 — Parallel Scraping**
-    7 scrapers · ThreadPoolExecutor
-    Each with isolated deadline cap`"]
+    7 scrapers · ThreadPoolExecutor`"]
 
-    S1["`🔍 reverse_face
-    Yandex · SerpApi · CSE
-    _90 s_`"]
-    S2["`🔎 search_engines
-    Google CSE · DDG · Bing
-    _25 s_`"]
-    S3["`🎓 academic
-    Scholar · OpenAlex · ORCID
-    _35 s_`"]
-    S4["`💻 github
-    Public API · no auth
-    _20 s_`"]
-    S5["`🗨 reddit
-    PRAW · JSON fallback
-    _15 s_`"]
-    S6["`🗂 passive
-    Wayback · GDELT · crt.sh
-    _20 s_`"]
-    S7["`🕵 username
-    125 direct + Sherlock 300+
-    _50 s_`"]
+    S1["`Reverse Face Search
+    Yandex · SerpApi Lens · Google CSE`"]
+    S2["`Search Engines
+    Google CSE · DDG · Bing`"]
+    S3["`Academic
+    Scholar · OpenAlex · ORCID`"]
+    S4["`Developer
+    GitHub · GitLab`"]
+    S5["`Social
+    Reddit · PRAW`"]
+    S6["`Passive OSINT
+    Wayback · GDELT · crt.sh`"]
+    S7["`Username
+    125 direct + Sherlock 300+`"]
 
     MATCH["`**Layer 3 — Face Matching**
-    Download · embed · cosine compare
-    face_score set on every candidate`"]
+    Download · embed · cosine compare`"]
 
-    SCORE["`**Layer 4 — Weighted Scoring**
-    70% face · 10% name · 18% meta
-    Cosine thresholds: CONFIRMED / POSSIBLE / REJECTED`"]
+    SCORE["`**Layer 4 — Scoring**
+    70% face · 10% name · 18% meta`"]
 
     RESOLVE["`**Layer 5 — Entity Resolution**
-    Union-Find identity graph
-    Edge weights by signal type`"]
+    Union-Find identity graph`"]
 
     OUT["`**Output**
-    📄 info.txt · 📊 JSON · 🖼 Photos · 🗄 SQLite`"]
+    info.txt · JSON · Photos · SQLite`"]
 
     INPUT --> EMB
     EMB <--> DB
@@ -87,116 +216,6 @@ flowchart TD
     MATCH --> SCORE
     SCORE --> RESOLVE
     RESOLVE --> OUT
-
-    style INPUT fill:#1e293b,stroke:#38bdf8,color:#f1f5f9
-    style EMB fill:#1e3a5f,stroke:#60a5fa,color:#f1f5f9
-    style DB fill:#1c2a1e,stroke:#4ade80,color:#f1f5f9
-    style SCRAPE fill:#2d1b4e,stroke:#a78bfa,color:#f1f5f9
-    style S1 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style S2 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style S3 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style S4 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style S5 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style S6 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style S7 fill:#1a2535,stroke:#f472b6,color:#f1f5f9
-    style MATCH fill:#1e3a5f,stroke:#60a5fa,color:#f1f5f9
-    style SCORE fill:#3b1f1f,stroke:#fb923c,color:#f1f5f9
-    style RESOLVE fill:#1c2a1e,stroke:#4ade80,color:#f1f5f9
-    style OUT fill:#1e293b,stroke:#38bdf8,color:#f1f5f9
-```
-
----
-
-## Architecture
-
-```mermaid
-graph TB
-    subgraph ENTRY["Entry Points"]
-        APP["`**app.py**
-        Flask + SSE
-        Browser camera / upload`"]
-        MAIN["`**main.py**
-        OpenCV display loop
-        Local webcam only`"]
-    end
-
-    subgraph L1["Layer 1 — Embedding  ·  embedding.py"]
-        EMBED["`DeepFace.represent()
-        Model: Facenet512
-        Detector: opencv  |  Align: true
-        Threshold: 0.50  |  Output: 512-D vector`"]
-    end
-
-    subgraph L2["Layer 2 — Persistence  ·  storage/database.py"]
-        DB[("`SQLite WAL
-        searches · matches
-        face_vectors`")]
-    end
-
-    subgraph L3["Layer 3 — Parallel Scraping  ·  scrapers/"]
-        direction LR
-        RF["`reverse_face.py
-        Yandex · SerpApi Lens
-        Google CSE · 4 engines
-        Top 25 face-verified`"]
-        SE["`search_engines.py
-        Google CSE → DDG → Bing
-        LinkedIn-first cascade
-        10 social platforms`"]
-        AC["`academic.py
-        Semantic Scholar
-        OpenAlex · ORCID
-        1-hr cache · dedup`"]
-        GH["`github · reddit
-        GitHub public API
-        PRAW / JSON fallback`"]
-        PA["`passive.py
-        Wayback · GDELT
-        crt.sh · PGP servers
-        Gravatar`"]
-        UN["`username.py
-        125 direct checks
-        + Sherlock 300+ (15 s cap)
-        socid-extractor`"]
-    end
-
-    subgraph L4["Layer 4 — Face Matching  ·  aggregator/face_matcher.py"]
-        FM["`URL-deduplicated download cache
-        Parallel embedding extraction
-        Sets face_score · face_similarity
-        face_verified on every match`"]
-    end
-
-    subgraph L5["Layer 5 — Scoring  ·  aggregator/scorer.py"]
-        SC["`combined = 0.70·face + 0.10·name
-                + 0.08·social + 0.05·photo
-                + 0.07·sources
-        ≥ 0.68 → CONFIRMED  |  0.50–0.68 → POSSIBLE
-        < 0.35 → REJECTED`"]
-    end
-
-    subgraph L6["Layer 6 — Entity Resolution  ·  aggregator/resolver.py"]
-        RES["`Union-Find identity graph
-        face-match 1.0  |  email 0.90
-        username 0.85  |  company 0.45
-        name 0.40  |  location 0.30`"]
-    end
-
-    subgraph OUT["Output  ·  storage/folder_writer.py"]
-        direction LR
-        TXT[info.txt]
-        JSON[matches_summary.json]
-        PHOTOS[scraped_photos/]
-        SQLOUT[(face_osint.db)]
-    end
-
-    APP & MAIN --> L1
-    L1 <--> L2
-    L1 --> L3
-    RF & SE & AC & GH & PA & UN --> L4
-    L4 --> L5
-    L5 --> L6
-    L6 --> OUT
 ```
 
 ---
@@ -204,95 +223,55 @@ graph TB
 ## Quick Start
 
 ```bash
-# Python 3.10 or 3.11 required  (3.12 breaks TensorFlow 2.16)
+# Python 3.10 or 3.11 required (TensorFlow 2.16 breaks on 3.12)
 pip install -r requirements.txt
 
-cp .env.example .env          # all keys optional — works without any
+cp .env.example .env    # all keys optional — works without any
 
-python diagnose.py             # health check: packages, keys, network
-python app.py                  # web UI — browser opens automatically
+python diagnose.py      # health check: packages, keys, network
+python app.py           # opens http://localhost:5000 automatically
 ```
 
-> First run downloads Facenet512 model weights (~600 MB) into `data/models/` once.
+**First run downloads:**
+- Facenet512 model weights (~600 MB) into `data/models/` — for Face OSINT
+- YOLOv8n weights (~6 MB) into ultralytics cache — for CIC detection
 
----
-
-## Verdict System
-
-```mermaid
-graph LR
-    A[Combined Score] --> B{Threshold}
-    B -->|≥ 0.85| C["🟢 CONFIRMED (high)\nFace verified · consistent metadata"]
-    B -->|≥ 0.70| D["🟡 CONFIRMED (low)\nFace verified · limited metadata"]
-    B -->|≥ 0.55| E["🟠 POSSIBLE\nNear-match face OR strong metadata"]
-    B -->|< 0.55| F["🔴 UNLIKELY\nName match only · no photo evidence"]
-
-    style C fill:#14532d,stroke:#4ade80,color:#f1f5f9
-    style D fill:#1a3a1a,stroke:#86efac,color:#f1f5f9
-    style E fill:#431407,stroke:#fb923c,color:#f1f5f9
-    style F fill:#3b0a0a,stroke:#f87171,color:#f1f5f9
-```
-
-> **Face similarity alone** gates the "POSSIBLE" threshold — text metadata alone can reach a maximum combined score of 0.28, which is below the 0.50 floor.
+Both download once and are cached indefinitely.
 
 ---
 
 ## Input Modes
 
-| Mode | How to use |
-|---|---|
-| **Browser camera** | Click the Camera tab → allow browser access → click Capture |
-| **File upload** | Drag and drop or select any JPEG / PNG / WebP |
-| **WiFi / IP camera** | Install [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) (Android) · tap Start server · enter `IP:8080` in the WiFi Cam tab |
-| **Name hints** | Append context to the name field: `John Smith \| New York @ Acme Corp` |
-
-**Name hint syntax:**
-
-```
-John Smith | New York               ← location context
-John Smith @ Acme Corp             ← employer context
-John Smith | New York @ Acme Corp  ← both
-```
-
----
-
-## Scraper Reference
-
-| Scraper | Timeout | Sources | Notes |
-|---|---|---|---|
-| `reverse_face` | 90 s | Yandex · SerpApi Lens · Google CSE | 4 engines parallel · face-verifies top 25 hits |
-| `search_engines` | 25 s | Google CSE → DDG → Bing | LinkedIn-first · 10 social platforms |
-| `academic` | 35 s | Semantic Scholar · OpenAlex · ORCID | 1-hr cache · Scholar dedup by user ID |
-| `github` | 20 s | GitHub public API | 5,000 req/hr with token · 60/hr without |
-| `reddit` | 15 s | PRAW · public JSON fallback | No auth required |
-| `passive` | 20 s | Wayback · GDELT · crt.sh · PGP · Gravatar | Certificate transparency + key servers |
-| `username` | 50 s | 125 direct platform checks | + Sherlock 300+ (15 s internal cap) |
-
-> LinkedIn enrichment loop: `reverse_face` confirmed hits are re-fed into `search_engines` for deeper profile discovery.
+| Mode | Where | How |
+|---|---|---|
+| **Browser webcam** | Face OSINT | Camera tab → Allow → Capture |
+| **File upload** | Face OSINT | Drag-and-drop any JPEG/PNG/WebP |
+| **WiFi/IP camera** | Face OSINT + CIC | Enter `IP:port` — auto-probes MJPEG endpoints |
+| **Video file** | CIC only | Enter full path or `data\filename.mp4` |
+| **RTSP stream** | CIC only | Enter `rtsp://...` URL |
+| **Name hints** | Face OSINT | `John Smith \| New York @ Acme Corp` |
 
 ---
 
 ## API Keys
 
-All keys are optional. The system runs on ~8 free sources with no configuration.
+All optional. The system runs on free sources with no configuration.
 
-Copy `.env.example` → `.env` and fill in what you have.
-
-| Key | Where to get | Free tier | Unlocks |
-|---|---|---|---|
-| `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` | [programmablesearchengine.google.com](https://programmablesearchengine.google.com) | 100 req/day | Best LinkedIn + social search |
-| `SERPAPI_KEY` | [serpapi.com](https://serpapi.com) | 100 req/month | Google Lens + Yandex face search |
-| `IMGBB_API_KEY` | [imgbb.com/api](https://imgbb.com) | Free | Image hosting for SerpApi upload |
-| `GITHUB_TOKEN` | GitHub → Settings → Developer tokens | Free | 5,000 req/hr (vs 60/hr unauthenticated) |
-| `GITLAB_TOKEN` | GitLab → Profile → Access Tokens | Free | GitLab user search (required since 2024) |
-| `BING_API_KEY` | Azure → Bing Search v7 | 1,000 req/month | Bing web + visual search |
-| `BRAVE_API_KEY` | [api.search.brave.com](https://api.search.brave.com) | 2,000 req/month | Brave Search results |
-| `HUNTER_API_KEY` | [hunter.io/api-keys](https://hunter.io/api-keys) | 25 req/month | Email intelligence |
-| `REDDIT_CLIENT_ID` + `SECRET` | reddit.com/prefs/apps | Free | Authenticated Reddit API |
-| `OPENALEX_MAILTO` | any email address | Free | OpenAlex polite pool (higher rate limits) |
+| Key | Free tier | Unlocks |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Pay-as-you-go | CIC LLM operator interface (Claude) |
+| `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` | 100 req/day | LinkedIn + social search |
+| `SERPAPI_KEY` | 100 req/month | Google Lens + Yandex face search |
+| `IMGBB_API_KEY` | Free | Image hosting for SerpApi upload |
+| `GITHUB_TOKEN` | Free | 5,000 req/hr (vs 60/hr unauthenticated) |
+| `GITLAB_TOKEN` | Free | GitLab user search |
+| `BING_API_KEY` | 1,000 req/month | Bing web + visual search |
+| `BRAVE_API_KEY` | 2,000 req/month | Brave Search results |
+| `HUNTER_API_KEY` | 25 req/month | Email intelligence |
+| `REDDIT_CLIENT_ID` + `SECRET` | Free | Authenticated Reddit API |
 
 ```bash
-python diagnose.py    # see which keys are active and test connectivity
+python diagnose.py    # shows which keys are active and tests connectivity
 ```
 
 ---
@@ -301,64 +280,85 @@ python diagnose.py    # see which keys are active and test connectivity
 
 ```
 data/output/
-└── John_Doe_20260404_1430_a1b2c3d4/
-    ├── captured_photo.jpg        original camera frame
-    ├── face_crop.jpg             160×160 aligned face crop (Facenet512 input)
-    ├── info.txt                  human-readable plaintext report
-    ├── matches_summary.json      full structured data — all scores + metadata
+└── John_Doe_20260619_1430_a1b2c3d4/
+    ├── captured_photo.jpg          original input frame
+    ├── face_crop.jpg               160×160 aligned face crop (Facenet512 input)
+    ├── info.txt                    human-readable plaintext report
+    ├── matches_summary.json        full structured data — all scores + metadata
     └── scraped_photos/
         ├── github_johndoe_a1b2.jpg
         ├── reverse_face_yandex_c3d4.jpg
         └── ...
 ```
 
-Search history and face vectors are persisted in `data/face_osint.db` (SQLite WAL).
-
----
-
-## CLI Interface
-
-```bash
-python main.py    # OpenCV window — click the window first to capture keystrokes
-```
-
-| Key | Action |
-|---|---|
-| `SPACE` | Freeze frame → enter name → start full OSINT search |
-| `F` | Flip / mirror the camera feed |
-| `D` | Diagnostic — print cosine distances against all stored face vectors |
-| `H` | Toggle HUD overlay |
-| `Q` | Quit |
+CIC annotated frames can be saved via the `/crowd/api/frame/<slot>` endpoint (returns base64 JPEG).
 
 ---
 
 ## Tech Stack
 
-| Component | Library | Why |
+| Layer | Library | Role |
 |---|---|---|
-| Face embedding | [DeepFace](https://github.com/serengil/deepface) + Facenet512 | 512-D L2-normalised vectors, ArcFace-level accuracy |
-| Web UI | Flask + Server-Sent Events | Zero-install, live progress streaming |
-| Camera | OpenCV (`cv2`) | Native Windows webcam + MJPEG WiFi streams |
-| Persistence | SQLite (WAL mode) | Single file, zero config, thread-safe |
-| HTML parsing | BeautifulSoup + lxml | Fast, lenient scraping of search results |
-| Name matching | rapidfuzz | Fuzzy string scoring for entity resolution |
-| Username OSINT | [Sherlock](https://github.com/sherlock-project/sherlock) + direct checks | 300+ platforms |
+| Face embedding | DeepFace + Facenet512 | 512-D L2-normalised vectors |
+| Person detection | YOLOv8n (ultralytics) | 5 FPS CPU inference, 6MB model |
+| Person tracking | ByteTrack (built-in ultralytics) | Persistent IDs, trajectory history |
+| Optical flow | OpenCV Farneback | Crowd direction + speed |
+| GIS map | Leaflet.js + Leaflet.heat | Zone polygons + person heat layer |
+| LLM operator | Anthropic Claude API | Streaming SSE chat with zone context |
+| Live charts | Chart.js | Occupancy bars + 5-min trend lines |
+| Web UI | Flask + Server-Sent Events | Zero-install, live push |
+| Camera | OpenCV (`cv2`) | Webcam + MJPEG + RTSP + video files |
+| Persistence | SQLite WAL mode | Thread-safe, single-file, no config |
+| HTML parsing | BeautifulSoup + lxml | Scraping search results |
+| Name matching | rapidfuzz | Fuzzy string entity resolution |
+| Username OSINT | Sherlock + direct checks | 300+ platforms |
 
-**Design constraints:** single process · no Celery / Redis / Docker / PostgreSQL · daemon threads + `ThreadPoolExecutor` · all shared state behind `threading.Lock`.
+---
+
+## Verdict System (Face OSINT)
+
+```mermaid
+graph LR
+    A[Combined Score] --> B{Threshold}
+    B -->|≥ 0.85| C["CONFIRMED (high)\nFace verified · consistent metadata"]
+    B -->|≥ 0.70| D["CONFIRMED (low)\nFace verified · limited metadata"]
+    B -->|≥ 0.55| E["POSSIBLE\nNear-match face OR strong metadata"]
+    B -->|< 0.55| F["UNLIKELY\nName match only · no photo evidence"]
+
+    style C fill:#14532d,stroke:#4ade80,color:#f1f5f9
+    style D fill:#1a3a1a,stroke:#86efac,color:#f1f5f9
+    style E fill:#431407,stroke:#fb923c,color:#f1f5f9
+    style F fill:#3b0a0a,stroke:#f87171,color:#f1f5f9
+```
+
+Score weights: `0.70 × face_similarity + 0.10 × name_match + 0.08 × social_signals + 0.05 × photo_count + 0.07 × source_diversity`
+
+---
+
+## Risk Levels (CIC)
+
+| Level | Density | Border | Action |
+|---|---|---|---|
+| **SAFE** | < 1.5 p/m² | Green | Normal monitoring |
+| **CAUTION** | 1.5–3.0 p/m² | Amber | Alert generated; deploy stewards |
+| **HIGH RISK** | 3.0–6.0 p/m² | Orange | Activate crowd diversion |
+| **CRITICAL** | > 6.0 p/m² | Red | SOP-3 crush prevention; audio alarm |
+
+*Thresholds are per-zone configurable in `crowd/zones.json`.*
 
 ---
 
 ## Requirements
 
 - Python **3.10** or **3.11** — TensorFlow 2.16 does not support 3.12
-- ~600 MB disk for Facenet512 model weights (downloaded once on first run)
-- Webcam, WiFi camera, or file upload
+- ~610 MB disk (Facenet512 600MB + YOLOv8n 6MB — both downloaded once)
+- Webcam, IP camera, video file, or RTSP stream for CIC
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Optional extras for better coverage:
+Optional extras:
 
 ```bash
 pip install sherlock-project    # username scraper (300+ platforms)
@@ -372,12 +372,14 @@ pip install praw                # authenticated Reddit API
 
 | Symptom | Fix |
 |---|---|
-| **"No face detected"** | Face must fill ≥ 20% of the frame · avoid backlighting · move closer |
-| **`no_results` on a common name** | Add context: `John Smith \| London` or `John Smith @ Google` |
-| **Search takes ~90 seconds** | Expected — `reverse_face` downloads and face-verifies up to 25 candidate photos |
-| **TensorFlow import errors** | Use Python 3.10 or 3.11 — TF 2.16 does not support 3.12 |
+| **CIC shows video but no bounding boxes** | YOLO loads in ~15–20s on first use per session; boxes appear automatically |
+| **CIC total count shows but no video tile** | Open CIC overlay while slot is active — it auto-syncs server state |
+| **LLM chat returns error** | Check `ANTHROPIC_API_KEY` is set in `.env` |
+| **IP camera not connecting** | Ensure IP and PC are on the same subnet; try `http://IP:port/video` in browser first |
+| **"No face detected" (Face OSINT)** | Face must fill ≥ 20% of frame · avoid backlighting · move closer |
+| **Khoya-Paya finds 0 faces in CIC index** | Faces are captured every 60 s per tracked person; run a slot for at least 60–90 s and check the DB: `SELECT COUNT(*) FROM cic_face_captures` |
+| **TensorFlow import errors** | Use Python 3.10 or 3.11 — TF 2.16 does not support 3.12; also install `tf-keras` |
 | **LinkedIn always 0 results** | Set `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` in `.env` |
-| **WiFi camera won't connect** | Phone and PC must be on the same subnet · test `http://IP:8080/video` in a browser first |
 
 ```bash
 python diagnose.py    # end-to-end health check with targeted fix instructions
@@ -391,19 +393,22 @@ Everything stays on your machine — no telemetry, no cloud sync.
 
 | Path | Contents |
 |---|---|
-| `data/face_osint.db` | Search history, match records, 512-D face vectors |
-| `data/output/` | Per-search folders: photos, reports, JSON |
-| `data/models/` | DeepFace model weights (~600 MB, downloaded once) |
+| `data/face_osint.db` | SQLite WAL — tables: `searches`, `matches`, `face_vectors` (512-D BLOB), `cic_face_captures` |
+| `data/output/` | Per-search folders: captured photo, face crop, info.txt, matches_summary.json, scraped photos |
+| `data/models/` | DeepFace Facenet512 weights (~600 MB, downloaded once) |
+| `crowd/zones.json` | CIC zone definitions — lat/lon polygons, area_m², density thresholds (editable) |
 | `logs/` | Rotating logs, 10 MB × 5 files |
 
-To wipe all search data: delete `data/face_osint.db` and `data/output/`.  
-The tool makes no outbound connections except to the scraping sources listed above.
+**`cic_face_captures`** stores each crowd-camera face embedding (track ID, slot, zone, timestamp, 512-D vector). Queried by Khoya-Paya lost-person search. Grows as cameras run; safe to truncate between sessions.
+
+To wipe all search data: delete `data/face_osint.db` and `data/output/`.
 
 ---
 
 ## Responsible Use
 
-This tool is built for **legitimate OSINT research** — verifying identities, locating missing persons, investigating fraud, academic research, and penetration testing with explicit authorisation.
+Built for **legitimate OSINT research** — verifying identities, locating missing persons, investigating fraud, academic research, penetration testing with explicit authorization, and event safety management demonstration.
 
-Do not use it to stalk, harass, or build unauthorised profiles of private individuals.  
+Do not use to stalk, harass, or build unauthorized profiles of private individuals.  
+CIC camera analysis must only be performed on footage you have the legal right to process.  
 Comply with applicable laws in your jurisdiction. Respect platform terms of service.
