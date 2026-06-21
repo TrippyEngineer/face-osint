@@ -12,6 +12,8 @@ def test_resolve_merges_same_email():
          "verdict": "confirmed", "url": "https://github.com/jane", "source": "github"}
     b = {"name": "Jane D", "email": "jane@x.com", "combined_score": 0.6,
          "verdict": "possible", "url": "https://twitter.com/jane", "source": "twitter"}
+    # merges via the exact-email edge (0.90), NOT name similarity
+    # ("Jane" vs "Jane D" ~0.73, below the 0.80 name-edge threshold)
     out = resolver.resolve("Jane", [a, b])
     assert out["email"] == "jane@x.com"
     assert len(out["all_profiles"]) == 2
