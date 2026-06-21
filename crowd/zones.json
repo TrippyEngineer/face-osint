@@ -14,6 +14,7 @@
         [25.4265, 81.8875], [25.4260, 81.8825]
       ],
       "area_m2": 8000,
+      "fov_area_m2": 120,
       "capacity": 16000,
       "camera_slot": 0,
       "thresholds": {"caution": 1.5, "high": 3.0, "critical": 6.0},
@@ -28,6 +29,7 @@
         [25.4225, 81.8860], [25.4225, 81.8830]
       ],
       "area_m2": 2000,
+      "fov_area_m2": 70,
       "capacity": 4000,
       "camera_slot": 1,
       "thresholds": {"caution": 2.0, "high": 4.5, "critical": 7.0},
@@ -42,6 +44,7 @@
         [25.4182, 81.8848], [25.4177, 81.8803]
       ],
       "area_m2": 12000,
+      "fov_area_m2": 150,
       "capacity": 20000,
       "camera_slot": 2,
       "thresholds": {"caution": 1.0, "high": 2.5, "critical": 5.0},
@@ -56,6 +59,7 @@
         [25.4152, 81.8850], [25.4152, 81.8810]
       ],
       "area_m2": 5000,
+      "fov_area_m2": 90,
       "capacity": 8000,
       "camera_slot": 3,
       "thresholds": {"caution": 1.2, "high": 2.8, "critical": 5.5},

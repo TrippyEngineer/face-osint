@@ -157,6 +157,32 @@ CIC_DENSITY_CRITICAL = 6.0   # → red critical / stampede alert
 CIC_INFERENCE_FPS    = 5     # target FPS for YOLOv8n inference per slot
 CIC_MAX_SLOTS        = 4     # simultaneous camera slots
 
+# ── CIC detection / calibration ────────────────────────────────────────────
+# Detection model + thresholds. Swap CIC_YOLO_MODEL to "yolov8s.pt"/"yolov8m.pt"
+# for higher recall in dense crowds (auto-downloads; slower on CPU).
+CIC_YOLO_MODEL        = "yolov8n.pt"
+CIC_YOLO_CONF         = 0.25    # lower than the old 0.35 → catches more people
+CIC_INFERENCE_SIZE    = 960     # long-side px fed to YOLO (was a forced 640×480)
+CIC_MAX_DET           = 1000    # per-frame detection cap (was YOLO default 300)
+
+# Density = count / camera field-of-view area. Per-zone fov_area_m2 lives in
+# zones.json; this is the fallback when a zone omits it. NOTE: density must use
+# the camera's visible area, NOT the whole zone area, or risk never escalates.
+CIC_FOV_AREA_M2       = 100.0
+
+# Behavioural heuristics (crude — tune per deployment). Stricter than the old
+# 25-frame / 12-px defaults to cut false positives in crowds.
+CIC_CHILD_HEIGHT_RATIO = 0.22   # bbox height < ratio*frame height → "child"
+CIC_LOITER_FRAMES      = 40     # frames stationary before "loitering" (~8s @5fps)
+CIC_RUNNING_SPEED      = 18.0   # px/frame velocity to flag "running"
+CIC_FACE_MIN_CROP_PX   = 70     # skip Khoya-Paya capture for crops smaller than this
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  WEB / UPLOAD                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+MAX_UPLOAD_MB         = 512     # max request body (CIC videos); was a hard 10 MB
+
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  LOGGING SETUP  (call once at startup)                               ║

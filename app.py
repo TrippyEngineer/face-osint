@@ -61,7 +61,7 @@ from storage.folder_writer import FolderWriter
 from aggregator import face_matcher, scorer, resolver
 
 app    = Flask(__name__, static_folder=None)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024   # 10 MB max upload
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_UPLOAD_MB * 1024 * 1024   # configurable (default 512 MB)
 db     = Database()
 writer = FolderWriter()
 
@@ -949,6 +949,10 @@ def cic_upload_slot(slot):
     fname = secure_filename(f.filename) or f"slot{slot}_video.mp4"
     save_dir = Path(app.root_path) / "data" / "uploads"
     save_dir.mkdir(parents=True, exist_ok=True)
+    # Bound disk usage: drop this slot's previous upload(s) before saving the new one.
+    for _old in save_dir.glob(f"slot{slot}_*"):
+        try: _old.unlink()
+        except Exception: pass
     save_path = save_dir / f"slot{slot}_{fname}"
     try:
         f.save(str(save_path))
@@ -1898,7 +1902,12 @@ body{
 .cic-cam-header{display:flex;align-items:center;gap:5px;padding:5px 8px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0}
 .cic-cam-name{font-weight:600;color:var(--text-primary);flex:1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cic-cam-badge{background:var(--accent);color:#fff;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;white-space:nowrap}
-.cic-cam-img{width:100%;flex:1;object-fit:cover;display:block;background:#0a0c14;min-height:0}
+.cic-cam-img{width:100%;flex:1;object-fit:contain;display:block;background:#0a0c14;min-height:0;cursor:zoom-in}
+.cic-zoom-bg{position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:10000;display:none;align-items:center;justify-content:center;padding:24px}
+.cic-zoom-bg.show{display:flex}
+.cic-zoom-img{max-width:96vw;max-height:90vh;object-fit:contain;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6);background:#0a0c14}
+.cic-zoom-cap{position:absolute;top:16px;left:20px;color:#cbd5e1;font-size:13px;font-weight:600}
+.cic-zoom-close{position:absolute;top:12px;right:18px;font-size:30px;line-height:1;color:#fff;background:none;border:none;cursor:pointer}
 .cic-cam-footer{display:flex;align-items:center;gap:8px;padding:4px 8px;font-size:10px;flex-shrink:0;border-top:1px solid var(--border)}
 .cic-slot-ctrl{display:flex;gap:3px;margin-left:auto}
 .cic-btn-sm{background:var(--bg-base);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:2px 6px;font-size:9px;cursor:pointer;transition:.15s}
@@ -1967,6 +1976,28 @@ body{
     <div class="shortcut-row"><span class="shortcut-desc">Show shortcuts</span><span class="kbd">?</span></div>
     <div style="margin-top:16px;display:flex;justify-content:flex-end">
       <button class="btn btn-secondary" onclick="document.getElementById('shortcuts-bg').classList.remove('show')">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- CIC slot enlarge / zoom overlay -->
+<div class="cic-zoom-bg" id="cic-zoom-bg" onclick="if(event.target===this)cicZoomClose()">
+  <button class="cic-zoom-close" onclick="cicZoomClose()">&times;</button>
+  <span class="cic-zoom-cap" id="cic-zoom-cap"></span>
+  <img class="cic-zoom-img" id="cic-zoom-img" alt=""/>
+</div>
+
+<!-- CIC slot source modal -->
+<div class="modal-bg" id="cic-src-bg" onclick="if(event.target===this)cicSrcCancel()">
+  <div class="modal">
+    <h2>Start <span id="cic-src-slot">Slot</span></h2>
+    <p>Video source &mdash; <b>0</b> webcam | <b>data\crowd.mp4</b> file | <b>D:\path\video.mp4</b> full path | <b>192.168.x.x:8080</b> IP cam | <b>rtsp://...</b></p>
+    <input id="cic-src-input" type="text" placeholder="0"
+           style="width:100%;padding:9px;border-radius:7px;border:1px solid var(--border);background:var(--bg-elevated);color:var(--text-primary);font-size:13px;margin-bottom:14px"
+           onkeydown="if(event.key==='Enter')cicSrcConfirm()">
+    <div class="modal-btns">
+      <button class="btn btn-secondary" style="flex:1" onclick="cicSrcCancel()">Cancel</button>
+      <button class="btn btn-primary" style="flex:2" onclick="cicSrcConfirm()">&#9654; Start</button>
     </div>
   </div>
 </div>
@@ -2256,7 +2287,7 @@ body{
             <button class="cic-btn-sm" onclick="cicStopSlot(0)">&#9632; Stop</button>
           </div>
         </div>
-        <img class="cic-cam-img" id="cic-frame-0" alt=""/>
+        <img class="cic-cam-img" id="cic-frame-0" alt="" onclick="cicZoomSlot(0)" title="Click to enlarge"/>
         <div class="cic-cam-footer">
           <span class="cic-risk-safe" id="cic-risk-0">OFFLINE</span>
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-0">0.000 p/m&#178;</span>
@@ -2277,7 +2308,7 @@ body{
             <button class="cic-btn-sm" onclick="cicStopSlot(1)">&#9632; Stop</button>
           </div>
         </div>
-        <img class="cic-cam-img" id="cic-frame-1" alt=""/>
+        <img class="cic-cam-img" id="cic-frame-1" alt="" onclick="cicZoomSlot(1)" title="Click to enlarge"/>
         <div class="cic-cam-footer">
           <span class="cic-risk-safe" id="cic-risk-1">OFFLINE</span>
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-1">0.000 p/m&#178;</span>
@@ -2298,7 +2329,7 @@ body{
             <button class="cic-btn-sm" onclick="cicStopSlot(2)">&#9632; Stop</button>
           </div>
         </div>
-        <img class="cic-cam-img" id="cic-frame-2" alt=""/>
+        <img class="cic-cam-img" id="cic-frame-2" alt="" onclick="cicZoomSlot(2)" title="Click to enlarge"/>
         <div class="cic-cam-footer">
           <span class="cic-risk-safe" id="cic-risk-2">OFFLINE</span>
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-2">0.000 p/m&#178;</span>
@@ -2319,7 +2350,7 @@ body{
             <button class="cic-btn-sm" onclick="cicStopSlot(3)">&#9632; Stop</button>
           </div>
         </div>
-        <img class="cic-cam-img" id="cic-frame-3" alt=""/>
+        <img class="cic-cam-img" id="cic-frame-3" alt="" onclick="cicZoomSlot(3)" title="Click to enlarge"/>
         <div class="cic-cam-footer">
           <span class="cic-risk-safe" id="cic-risk-3">OFFLINE</span>
           <span style="color:var(--text-muted);font-size:10px" id="cic-dens-3">0.000 p/m&#178;</span>
@@ -3613,9 +3644,34 @@ function _cicFetchFrames() {
         if (d.ok) {
           var img = document.getElementById('cic-frame-' + slot);
           if (img) img.src = d.frame;
+          if (_cicZoomSlot === slot) {
+            var zimg = document.getElementById('cic-zoom-img');
+            if (zimg) zimg.src = d.frame;
+          }
         }
       }).catch(function() {});
   });
+}
+
+// ── Slot enlarge / zoom ──────────────────────────────────────────────────
+var _cicZoomSlot = null;
+function cicZoomSlot(slot) {
+  _cicZoomSlot = slot;
+  var bg   = document.getElementById('cic-zoom-bg');
+  var zimg = document.getElementById('cic-zoom-img');
+  var cap  = document.getElementById('cic-zoom-cap');
+  var src  = document.getElementById('cic-frame-' + slot);
+  if (zimg && src && src.src) zimg.src = src.src;
+  if (cap) {
+    var nm = document.querySelector('#cic-tile-' + slot + ' .cic-cam-name');
+    cap.textContent = nm ? nm.textContent : ('Slot ' + slot);
+  }
+  if (bg) bg.classList.add('show');
+}
+function cicZoomClose() {
+  _cicZoomSlot = null;
+  var bg = document.getElementById('cic-zoom-bg');
+  if (bg) bg.classList.remove('show');
 }
 
 // ── Platform SSE ───────────────────────────────────────────────────────────
@@ -3755,6 +3811,10 @@ function _cicUploadAndStart(slot, file) {
   }
   xhr.onload = function() {
     if (prog) prog.style.width = '0%';
+    if (xhr.status === 413) {
+      if (typeof toast === 'function') toast('Video too large — exceeds server upload limit', 'er');
+      return;
+    }
     var d;
     try { d = JSON.parse(xhr.responseText); } catch(e) { d = {}; }
     if (d.ok) {
@@ -3805,20 +3865,31 @@ function _cicSetupDragDrop() {
   }
 }
 
+var _cicSrcSlot = null;
 function cicStartSlot(slot) {
-  var dataDir = 'Place your video in data\\ folder (e.g. data\\crowd.mp4)';
-  var src = prompt(
-    'Camera Slot ' + slot + ' — enter video source:\n\n' +
-    '  0                       = local webcam\n' +
-    '  data\\crowd.mp4          = video file in project data\\ folder\n' +
-    '  D:\\full\\path\\video.mp4  = full Windows path\n' +
-    '  192.168.x.x:8080        = IP camera (auto-probes endpoints)\n' +
-    '  rtsp://...               = RTSP stream URL\n\n' +
-    'Tip: ' + dataDir,
-    slot === 0 ? '0' : 'data\\'
-  );
-  if (src === null || src === undefined) return;
-  src = src.trim();
+  _cicSrcSlot = slot;
+  var inp = document.getElementById('cic-src-input');
+  if (inp) inp.value = (slot === 0 ? '0' : '');
+  var lbl = document.getElementById('cic-src-slot');
+  if (lbl) lbl.textContent = 'Slot ' + slot;
+  var bg = document.getElementById('cic-src-bg');
+  if (bg) bg.classList.add('show');
+  if (inp) setTimeout(function(){ inp.focus(); }, 50);
+}
+function cicSrcCancel() {
+  var bg = document.getElementById('cic-src-bg');
+  if (bg) bg.classList.remove('show');
+  _cicSrcSlot = null;
+}
+function cicSrcConfirm() {
+  if (_cicSrcSlot === null) return;
+  var slot = _cicSrcSlot;
+  var inp  = document.getElementById('cic-src-input');
+  var src  = (inp ? inp.value : '').trim();
+  cicSrcCancel();
+  _cicDoStart(slot, src);
+}
+function _cicDoStart(slot, src) {
   fetch('/crowd/api/slot/' + slot + '/start', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},

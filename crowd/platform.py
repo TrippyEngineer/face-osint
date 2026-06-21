@@ -189,7 +189,7 @@ class Platform:
     # ── SSE pub-sub ───────────────────────────────────────────────────────
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue()
+        q: queue.Queue = queue.Queue(maxsize=200)   # bounded: drop on slow client, don't leak
         with self._lock:
             self._subscribers.append(q)
         return q

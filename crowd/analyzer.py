@@ -37,9 +37,9 @@ RISK_LABELS = {
 
 INFERENCE_FPS        = 5     # target inference FPS
 FLOW_EVERY_N         = 5     # optical flow frame stride
-LOITER_FRAMES        = 25    # frames stationary before "loitering" flag
+LOITER_FRAMES        = getattr(config, "CIC_LOITER_FRAMES", 25)   # frames stationary before "loitering"
 LOITER_PIXEL_THRESH  = 8     # px movement budget per frame to be "stationary"
-RUNNING_SPEED_THRESH = 12.0  # px/frame velocity to flag as "running"
+RUNNING_SPEED_THRESH = getattr(config, "CIC_RUNNING_SPEED", 12.0) # px/frame velocity to flag as "running"
 
 
 class CameraAnalyzer:
@@ -163,8 +163,14 @@ class CameraAnalyzer:
                     time.sleep(0.1)
                     continue
 
-            # Resize to 640×480 for inference
-            frame = cv2.resize(frame, (640, 480))
+            # Downscale for inference, preserving aspect ratio (no upscaling).
+            # Forcing 640×480 squished non-4:3 footage and threw away the
+            # resolution YOLO needs to spot small/distant people.
+            _h0, _w0 = frame.shape[:2]
+            _target  = getattr(config, "CIC_INFERENCE_SIZE", 960)
+            _scale   = _target / max(_h0, _w0)
+            if _scale < 1.0:
+                frame = cv2.resize(frame, (int(_w0 * _scale), int(_h0 * _scale)))
             self._frame_count += 1
 
             try:
@@ -195,7 +201,10 @@ class CameraAnalyzer:
             try:
                 results = model.track(
                     frame, classes=[0], persist=True, verbose=False,
-                    stream=False, conf=0.35, iou=0.45,
+                    stream=False, iou=0.45,
+                    conf=getattr(config, "CIC_YOLO_CONF", 0.25),
+                    imgsz=getattr(config, "CIC_INFERENCE_SIZE", 960),
+                    max_det=getattr(config, "CIC_MAX_DET", 1000),
                 )
                 if results and results[0].boxes is not None:
                     boxes = results[0].boxes
@@ -215,7 +224,7 @@ class CameraAnalyzer:
                             "id":       trk_id,
                             "center":   (cx, cy),
                             "height_px": bh,
-                            "is_child":  bh < h * 0.22,
+                            "is_child":  bh < h * getattr(config, "CIC_CHILD_HEIGHT_RATIO", 0.22),
                             **behavior,
                         })
             except Exception as e:
@@ -236,9 +245,11 @@ class CameraAnalyzer:
         flow_data = self._compute_flow(gray)
 
         # Zone density + risk
-        count   = len(detections)
-        area_m2 = self.zone_cfg.get("area_m2", 10000)
-        density = count / area_m2
+        count    = len(detections)
+        # Density must use the camera's visible area, not the whole zone area,
+        # otherwise count/area is microscopic and risk never escalates.
+        fov_area = self.zone_cfg.get("fov_area_m2") or getattr(config, "CIC_FOV_AREA_M2", 100.0)
+        density  = count / fov_area
         thresh  = self.zone_cfg.get("thresholds", {"caution": 1.5, "high": 3.0, "critical": 6.0})
         risk    = self._risk_level(density, thresh)
 
@@ -435,7 +446,7 @@ class CameraAnalyzer:
             return self._model if self._model is not False else None
         try:
             from ultralytics import YOLO
-            m = YOLO("yolov8n.pt")
+            m = YOLO(getattr(config, "CIC_YOLO_MODEL", "yolov8n.pt"))
             m.overrides["verbose"] = False
             self._model = m
             logger.info(f"Slot {self.slot_id}: YOLOv8n loaded")
@@ -466,6 +477,8 @@ class CameraAnalyzer:
             crop = frame[y1:y1 + head_h, x1:x2].copy()
             if crop.size == 0:
                 continue
+            if min(crop.shape[:2]) < getattr(config, "CIC_FACE_MIN_CROP_PX", 70):
+                continue   # too small to yield a usable face embedding
             self._face_capture_q.append((crop, tid))
             if len(self._face_capture_q) > 20:   # safety cap
                 self._face_capture_q.pop(0)
