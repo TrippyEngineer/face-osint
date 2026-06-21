@@ -12,6 +12,10 @@ def test_face_verified_outranks_name_only():
     assert out[0].get("face_verified") is True
     assert face["verdict"] == "confirmed"
     assert face["combined_score"] >= config.VERDICT_CONFIRMED_LOW
+    # genuinely outranks name-only on score (score_all mutates both dicts in
+    # place before filtering, so this holds even if name_only is filtered out)
+    assert name_only["verdict"] != "confirmed"
+    assert face["combined_score"] > name_only["combined_score"]
 
 
 def test_name_only_cannot_confirm():
