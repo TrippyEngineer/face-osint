@@ -20,7 +20,7 @@ Pillow==10.3.0
 # ── Face recognition ─────────────────────────────────────────────────────────
 # Downloads ~600 MB Facenet512 weights to data/models/ on first run.
 deepface==0.0.93
-tensorflow-intel==2.16.1
+tensorflow==2.16.1        # on Windows this resolves to tensorflow-intel==2.16.1
 tf-keras==2.16.0          # required by TensorFlow 2.16+
 
 # ── Fuzzy string matching (entity resolution) ────────────────────────────────
