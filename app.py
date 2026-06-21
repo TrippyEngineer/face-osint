@@ -1899,7 +1899,7 @@ body{
   position:absolute;bottom:0;left:0;width:0%;height:3px;
   background:var(--accent);transition:width .1s linear;z-index:21;
 }
-.cic-cam-header{display:flex;align-items:center;gap:5px;padding:5px 8px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0}
+.cic-cam-header{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding:5px 8px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0}
 .cic-cam-name{font-weight:600;color:var(--text-primary);flex:1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cic-cam-badge{background:var(--accent);color:#fff;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;white-space:nowrap}
 .cic-cam-img{width:100%;flex:1;object-fit:contain;display:block;background:#0a0c14;min-height:0;cursor:zoom-in}
@@ -1911,6 +1911,7 @@ body{
 .cic-cam-footer{display:flex;align-items:center;gap:8px;padding:4px 8px;font-size:10px;flex-shrink:0;border-top:1px solid var(--border)}
 .cic-slot-ctrl{display:flex;gap:3px;margin-left:auto}
 .cic-btn-sm{background:var(--bg-base);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:2px 6px;font-size:9px;cursor:pointer;transition:.15s}
+.cic-btn-sm:disabled{opacity:.4;cursor:not-allowed}
 .cic-btn-sm:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 .cic-btn-sm.heat-on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .cic-risk-safe{color:var(--green)}
@@ -3579,6 +3580,7 @@ function toggleCIC() {
     _cicSyncSlots();      // restore server-side active slots
     _cicConnectSSE();
     _cicStartPolling();
+    for (var _s = 0; _s < 4; _s++) _cicSetSlotUI(_s, _cicActiveSlots.has(_s));
   } else {
     _cicStopPolling();
     if (_cicSSE) { _cicSSE.close(); _cicSSE = null; }
@@ -3691,6 +3693,16 @@ function _cicConnectSSE() {
   };
 }
 
+function _cicSetSlotUI(slot, active) {
+  var tile = document.getElementById('cic-tile-' + slot);
+  if (!tile) return;
+  tile.querySelectorAll('.cic-slot-ctrl button').forEach(function(b) {
+    var oc = b.getAttribute('onclick') || '';
+    if (oc.indexOf('cicStartSlot') === 0) b.disabled = active;
+    else if (oc.indexOf('cicStopSlot') === 0) b.disabled = !active;
+  });
+}
+
 function _cicHandleUpdate(d) {
   var zones = d.zones || {};
   var total = d.total_count || 0;
@@ -3704,6 +3716,8 @@ function _cicHandleUpdate(d) {
     var z    = zones[zid];
     var slot = _cicZoneSlotMap[zid];
     if (slot === undefined) return;
+    if (!_cicActiveSlots.has(slot)) return;   // don't paint counts on inactive slots
+    _cicSetSlotUI(slot, true);                // active → Start disabled, Stop enabled
 
     var badge = document.getElementById('cic-badge-' + slot);
     if (badge) badge.textContent = z.count;
@@ -3914,6 +3928,7 @@ function _cicDoStart(slot, src) {
 function cicStopSlot(slot) {
   fetch('/crowd/api/slot/' + slot + '/stop', {method: 'POST'}).catch(function() {});
   _cicActiveSlots.delete(slot);
+  _cicSetSlotUI(slot, false);
   var img  = document.getElementById('cic-frame-' + slot);
   var tile = document.getElementById('cic-tile-' + slot);
   var dot  = document.getElementById('cic-dot-' + slot);

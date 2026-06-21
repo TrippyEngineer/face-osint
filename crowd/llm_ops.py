@@ -77,10 +77,9 @@ def ask(question: str, state: dict, api_key: str) -> Iterator[str]:
         yield "[anthropic SDK not installed — run: pip install anthropic]"
         return
 
-    context = _build_context(state)
-    prompt  = f"Current crowd data:\n{context}\n\nOperator question: {question}"
-
     try:
+        context = _build_context(state)
+        prompt  = f"Current crowd data:\n{context}\n\nOperator question: {question}"
         client = anthropic.Anthropic(api_key=api_key)
         with client.messages.stream(
             model="claude-sonnet-4-6",
