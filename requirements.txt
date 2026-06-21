@@ -3,36 +3,36 @@
 ## Install: pip install -r requirements.txt
 
 # ── Web framework ───────────────────────────────────────────────────────────
-flask
-flask-cors
-requests
-python-dotenv
+flask==3.0.0
+flask-cors==6.0.2
+requests==2.34.2
+python-dotenv==1.0.1
 
 # ── HTML parsing ─────────────────────────────────────────────────────────────
-beautifulsoup4
-lxml
+beautifulsoup4==4.12.3
+lxml==5.2.2
 
 # ── Image & camera ───────────────────────────────────────────────────────────
-opencv-python
-numpy
-Pillow
+opencv-python==4.10.0.84
+numpy==1.26.4
+Pillow==10.3.0
 
 # ── Face recognition ─────────────────────────────────────────────────────────
 # Downloads ~600 MB Facenet512 weights to data/models/ on first run.
-deepface
-tensorflow
-tf-keras          # required by TensorFlow 2.16+
+deepface==0.0.93
+tensorflow-intel==2.16.1
+tf-keras==2.16.0          # required by TensorFlow 2.16+
 
 # ── Fuzzy string matching (entity resolution) ────────────────────────────────
 # Falls back to a slower pure-Python implementation if absent.
-rapidfuzz
+rapidfuzz==3.9.3
 
 # ── Crowd Intelligence Center (CIC) ─────────────────────────────────────────
 # Core CIC features — required for the ⚡ CIC mode.
 #   YOLOv8n: auto-downloads 6 MB model on first run; person detection at ~5 FPS on CPU.
 #   anthropic: Claude API streaming operator assistant (set ANTHROPIC_API_KEY in .env).
-ultralytics>=8.0
-anthropic>=0.25
+ultralytics==8.4.71
+anthropic==0.83.0
 
 # ── Optional OSINT extras ─────────────────────────────────────────────────────
 # Uncomment to enable; the system works without them.
@@ -46,3 +46,7 @@ anthropic>=0.25
 # After pip install, run:  playwright install chromium
 # On WSL2 also run:        playwright install-deps chromium
 # playwright
+
+# ── Dev / serving (Phase 0) ──
+waitress==3.0.0
+pytest==8.3.3

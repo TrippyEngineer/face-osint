@@ -1,0 +1,6 @@
+# Light deps so CI can run the pure unit tests without TensorFlow/GUI OpenCV.
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+python-dotenv==1.0.1
+rapidfuzz==3.9.3
+pytest==8.3.3
