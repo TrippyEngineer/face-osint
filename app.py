@@ -1051,6 +1051,57 @@ def cic_ask():
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+# ── CIC Assistant: persisted multi-turn chats ───────────────────────────────
+@app.route("/crowd/api/chats", methods=["GET"])
+def cic_chats_list():
+    return jsonify(chats=db.list_chats())
+
+@app.route("/crowd/api/chats", methods=["POST"])
+def cic_chats_new():
+    import uuid
+    cid = uuid.uuid4().hex[:12]
+    db.create_chat(cid, "New chat")
+    return jsonify(id=cid)
+
+@app.route("/crowd/api/chats/<cid>", methods=["GET"])
+def cic_chat_get(cid):
+    if not db.chat_exists(cid):
+        return jsonify(error="not found"), 404
+    return jsonify(messages=db.get_chat_messages(cid))
+
+@app.route("/crowd/api/chats/<cid>", methods=["DELETE"])
+def cic_chat_delete(cid):
+    db.delete_chat(cid)
+    return jsonify(ok=True)
+
+@app.route("/crowd/api/chats/<cid>/message", methods=["POST"])
+def cic_chat_message(cid):
+    from crowd.llm_ops import ask_chat
+    d        = request.get_json() or {}
+    question = (d.get("question") or "").strip()
+    if not question:
+        return jsonify(error="question required"), 400
+    if not db.chat_exists(cid):
+        return jsonify(error="chat not found"), 404
+    db.add_chat_message(cid, "user", question)
+    # auto-title the chat from its first user message
+    if sum(1 for m in db.get_chat_messages(cid) if m["role"] == "user") == 1:
+        db.rename_chat(cid, question[:40])
+    history  = db.get_chat_messages(cid)
+    state    = get_platform().get_state()
+    api_key  = config.ANTHROPIC_API_KEY
+    def gen():
+        parts = []
+        for chunk in ask_chat(history, state, api_key):
+            parts.append(chunk)
+            yield f"data:{json.dumps({'text': chunk})}\n\n"
+        reply = "".join(parts).strip()
+        if reply:
+            db.add_chat_message(cid, "assistant", reply)
+        yield 'data:{"done":true}\n\n'
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 @app.route("/crowd/api/khoya", methods=["POST"])
 def cic_khoya():
     """Khoya-Paya: search face against OSINT db + CIC crowd captures."""
@@ -2295,6 +2346,7 @@ body{
       <button class="cic-tab" id="cic-tabn-map"       onclick="cicTab('map')">&#128205; Zone Map</button>
       <button class="cic-tab" id="cic-tabn-alerts"    onclick="cicTab('alerts')">&#128680; Alerts &amp; SOP</button>
       <button class="cic-tab" id="cic-tabn-analytics" onclick="cicTab('analytics')">&#128202; Analytics</button>
+      <button class="cic-tab" id="cic-tabn-assistant" onclick="cicTab('assistant')">&#128172; Assistant</button>
       <button class="cic-tab" id="cic-tabn-khoya"     onclick="cicTab('khoya')">&#128269; Lost Person</button>
     </div>
     <div id="cic-total-badge">Total: <b>0</b> persons</div>
@@ -2447,6 +2499,60 @@ body{
       <div class="cic-chart-card">
         <div class="cic-chart-title">Zone Density (persons / m&#178;)</div>
         <div class="cic-chart-wrap"><canvas id="cic-density-canvas"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: AI Assistant (multi-turn, persisted) -->
+  <div class="cic-panel" id="cic-panel-assistant">
+    <style>
+      #cic-panel-assistant .asst-wrap{display:flex;height:100%;min-height:0}
+      #cic-panel-assistant .asst-side{width:200px;flex:none;border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+      #cic-panel-assistant .asst-newbtn{margin:10px;padding:9px;border:1px solid var(--accent);border-radius:8px;background:rgba(99,102,241,.12);color:var(--accent-hover);font-weight:600;font-size:12px;cursor:pointer}
+      #cic-panel-assistant .asst-newbtn:hover{background:rgba(99,102,241,.22)}
+      #cic-panel-assistant .asst-chats{flex:1;overflow-y:auto;padding:0 8px 8px}
+      #cic-panel-assistant .asst-chat-item{display:flex;align-items:center;gap:6px;padding:7px 8px;border-radius:6px;font-size:12px;color:var(--text-muted);cursor:pointer}
+      #cic-panel-assistant .asst-chat-item:hover{background:rgba(255,255,255,.04);color:var(--text-primary)}
+      #cic-panel-assistant .asst-chat-item.active{background:rgba(99,102,241,.15);color:var(--text-primary)}
+      #cic-panel-assistant .asst-chat-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #cic-panel-assistant .asst-chat-del{opacity:.5;font-size:14px;line-height:1}
+      #cic-panel-assistant .asst-chat-del:hover{opacity:1;color:var(--red)}
+      #cic-panel-assistant .asst-empty{color:var(--text-muted);font-size:11px;padding:8px}
+      #cic-panel-assistant .asst-main{flex:1;display:flex;flex-direction:column;min-height:0}
+      #cic-panel-assistant .asst-head{padding:12px 16px 4px}
+      #cic-panel-assistant .asst-head h3{margin:0;font-size:15px}
+      #cic-panel-assistant .asst-head p{margin:2px 0 0;font-size:11px;color:var(--text-muted)}
+      #cic-panel-assistant .asst-thread{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:10px}
+      #cic-panel-assistant .asst-welcome{margin:auto;max-width:680px;text-align:center}
+      #cic-panel-assistant .asst-welcome h2{font-size:18px;margin:0 0 4px}
+      #cic-panel-assistant .asst-welcome p{font-size:12px;color:var(--text-muted);margin:0 0 16px}
+      #cic-panel-assistant .asst-cards{display:grid;grid-template-columns:1fr 1fr;gap:10px;text-align:left}
+      #cic-panel-assistant .asst-card{border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:12px;cursor:pointer;background:rgba(255,255,255,.02)}
+      #cic-panel-assistant .asst-card:hover{border-color:var(--accent);background:rgba(99,102,241,.08)}
+      #cic-panel-assistant .asst-msg{max-width:80%;padding:9px 13px;border-radius:12px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
+      #cic-panel-assistant .asst-msg.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:3px}
+      #cic-panel-assistant .asst-msg.assistant{align-self:flex-start;background:rgba(255,255,255,.05);border:1px solid var(--border);border-bottom-left-radius:3px}
+      #cic-panel-assistant .asst-chips{display:flex;flex-wrap:wrap;gap:6px;padding:6px 16px 0}
+      #cic-panel-assistant .asst-chip{border:1px solid var(--border);border-radius:14px;padding:4px 12px;font-size:11px;cursor:pointer;color:var(--text-muted)}
+      #cic-panel-assistant .asst-chip:hover{border-color:var(--accent);color:var(--text-primary)}
+      #cic-panel-assistant .asst-inputrow{display:flex;gap:8px;padding:10px 16px 14px}
+      #cic-panel-assistant .asst-input{flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.03);color:var(--text-primary);font-size:13px}
+      #cic-panel-assistant .asst-send{padding:10px 18px;border:none;border-radius:10px;background:var(--accent);color:#fff;font-weight:600;font-size:13px;cursor:pointer}
+      #cic-panel-assistant .asst-send:disabled{opacity:.5;cursor:not-allowed}
+    </style>
+    <div class="asst-wrap">
+      <div class="asst-side">
+        <button class="asst-newbtn" onclick="_asstNewChat()">+ New chat</button>
+        <div class="asst-chats" id="asst-chats"><div class="asst-empty">No chats yet</div></div>
+      </div>
+      <div class="asst-main">
+        <div class="asst-head"><h3>&#128172; Assistant</h3><p>Chat with Claude about live crowd conditions &mdash; zones, risk, SOP guidance. Off-topic asks get redirected.</p></div>
+        <div class="asst-thread" id="asst-thread"></div>
+        <div class="asst-chips" id="asst-chips"></div>
+        <div class="asst-inputrow">
+          <input id="asst-input" class="asst-input" type="text" placeholder="Ask about zones, risk, SOP, lost person&hellip;" onkeydown="if(event.key==='Enter')_asstSend()"/>
+          <button id="asst-send" class="asst-send" onclick="_asstSend()">Send</button>
+        </div>
       </div>
     </div>
   </div>
@@ -3677,6 +3783,7 @@ function cicTab(name) {
     setTimeout(_cicInitCharts, 50);
   }
   if (name === 'alerts') { _cicLoadClips(); }
+  if (name === 'assistant') { _asstInit(); }
 }
 
 // Incident clips: list recorded clips (from persisted alert history) with links
@@ -3692,6 +3799,166 @@ function _cicLoadClips() {
         return '<div style="font-size:11px;padding:3px 0"><a href="/crowd/api/incident_clip/'+encodeURIComponent(f)+'" target="_blank" rel="noopener" class="result-link">&#128249; '+esc(a.zone_name||a.zone||'zone')+' &middot; '+esc(String(a.severity||'').toUpperCase())+' &middot; '+esc(a.created_at||'')+'</a></div>';
       }).join('');
   }).catch(function(){});
+}
+
+// ── AI Assistant (multi-turn, persisted) ────────────────────────────────────
+var _asstChatId = null, _asstBusy = false;
+var _ASST_PROMPTS = [
+  'Which zones need attention right now?',
+  'Summarize the current crowd risk.',
+  'Recommended SOP for the highest-risk zone?',
+  'Any zone trending up in the last few minutes?',
+  'What is the lost-person procedure?'
+];
+var _ASST_CHIPS = {
+  'Zones':       'Give a status rundown of every active zone.',
+  'Risk':        'Summarize the current crowd risk and what is driving it.',
+  'SOP':         'What SOP should I follow for the highest-risk zone right now?',
+  'Trends':      'Which zones are trending up, and how fast?',
+  'Lost person': 'Walk me through the lost-person (Khoya-Paya) procedure.'
+};
+
+function _asstInit() {
+  _asstRenderChips();
+  _asstLoadChats();
+  if (!_asstChatId) _asstShowWelcome();
+}
+
+function _asstRenderChips() {
+  var el = document.getElementById('asst-chips'); if (!el) return;
+  el.innerHTML = '';
+  Object.keys(_ASST_CHIPS).forEach(function(k) {
+    var c = document.createElement('span');
+    c.className = 'asst-chip';
+    c.textContent = k;
+    c.onclick = function() { _asstUsePrompt(_ASST_CHIPS[k]); };
+    el.appendChild(c);
+  });
+}
+
+function _asstShowWelcome() {
+  var t = document.getElementById('asst-thread'); if (!t) return;
+  t.innerHTML = '';
+  var w = document.createElement('div');
+  w.className = 'asst-welcome';
+  w.innerHTML = '<h2>Ask Claude about crowd conditions</h2>' +
+    '<p>Live zone counts, density, risk and SOP guidance. Off-topic asks get redirected.</p>';
+  var grid = document.createElement('div');
+  grid.className = 'asst-cards';
+  _ASST_PROMPTS.forEach(function(p) {
+    var card = document.createElement('div');
+    card.className = 'asst-card';
+    card.textContent = p;
+    card.onclick = function() { _asstUsePrompt(p); };
+    grid.appendChild(card);
+  });
+  w.appendChild(grid);
+  t.appendChild(w);
+}
+
+function _asstLoadChats() {
+  fetch('/crowd/api/chats').then(function(r) { return r.json(); }).then(function(d) {
+    var el = document.getElementById('asst-chats'); if (!el) return;
+    el.innerHTML = '';
+    var chats = d.chats || [];
+    if (!chats.length) { el.innerHTML = '<div class="asst-empty">No chats yet</div>'; return; }
+    chats.forEach(function(c) {
+      var item = document.createElement('div');
+      item.className = 'asst-chat-item' + (c.id === _asstChatId ? ' active' : '');
+      item.onclick = function() { _asstOpenChat(c.id); };
+      var title = document.createElement('span');
+      title.className = 'asst-chat-title';
+      title.textContent = c.title || 'New chat';
+      var del = document.createElement('span');
+      del.className = 'asst-chat-del';
+      del.innerHTML = '&times;';
+      del.onclick = function(e) { e.stopPropagation(); _asstDeleteChat(c.id); };
+      item.appendChild(title); item.appendChild(del);
+      el.appendChild(item);
+    });
+  }).catch(function() {});
+}
+
+function _asstNewChat() {
+  fetch('/crowd/api/chats', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+    _asstChatId = d.id;
+    _asstShowWelcome();
+    _asstLoadChats();
+    var i = document.getElementById('asst-input'); if (i) i.focus();
+  }).catch(function() {});
+}
+
+function _asstOpenChat(cid) {
+  fetch('/crowd/api/chats/' + encodeURIComponent(cid)).then(function(r) { return r.json(); }).then(function(d) {
+    _asstChatId = cid;
+    var t = document.getElementById('asst-thread'); if (t) t.innerHTML = '';
+    (d.messages || []).forEach(function(m) { _asstAddMsg(m.role, m.content); });
+    if (!(d.messages || []).length) _asstShowWelcome();
+    _asstLoadChats();
+  }).catch(function() {});
+}
+
+function _asstDeleteChat(cid) {
+  fetch('/crowd/api/chats/' + encodeURIComponent(cid), { method: 'DELETE' }).then(function() {
+    if (cid === _asstChatId) { _asstChatId = null; _asstShowWelcome(); }
+    _asstLoadChats();
+  }).catch(function() {});
+}
+
+function _asstAddMsg(role, content) {
+  var t = document.getElementById('asst-thread'); if (!t) return null;
+  var w = t.querySelector('.asst-welcome'); if (w) t.innerHTML = '';
+  var div = document.createElement('div');
+  div.className = 'asst-msg ' + (role === 'user' ? 'user' : 'assistant');
+  div.textContent = content;
+  t.appendChild(div);
+  t.scrollTop = t.scrollHeight;
+  return div;
+}
+
+function _asstUsePrompt(text) {
+  var i = document.getElementById('asst-input'); if (i) i.value = text;
+  _asstSend();
+}
+
+function _asstSend() {
+  if (_asstBusy) return;
+  var input = document.getElementById('asst-input');
+  var q = (input ? input.value : '').trim();
+  if (!q) return;
+  var send = document.getElementById('asst-send');
+  function go(cid) {
+    _asstChatId = cid;
+    if (input) input.value = '';
+    _asstAddMsg('user', q);
+    var bubble = _asstAddMsg('assistant', '…');
+    var text = '';
+    _asstBusy = true; if (send) send.disabled = true;
+    fetch('/crowd/api/chats/' + encodeURIComponent(cid) + '/message', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q })
+    }).then(function(r) {
+      var reader = r.body.getReader(), dec = new TextDecoder();
+      function pump() {
+        reader.read().then(function(res) {
+          if (res.done) { _asstBusy = false; if (send) send.disabled = false; _asstLoadChats(); return; }
+          dec.decode(res.value, { stream: true }).split('\n').forEach(function(line) {
+            if (line.indexOf('data:') === 0) {
+              try {
+                var m = JSON.parse(line.slice(5));
+                if (m.text) { text += m.text; if (bubble) bubble.textContent = text; }
+              } catch (e) {}
+            }
+          });
+          var t = document.getElementById('asst-thread'); if (t) t.scrollTop = t.scrollHeight;
+          pump();
+        }).catch(function() { _asstBusy = false; if (send) send.disabled = false; });
+      }
+      pump();
+    }).catch(function(e) { if (bubble) bubble.textContent = 'Error: ' + e.message; _asstBusy = false; if (send) send.disabled = false; });
+  }
+  if (_asstChatId) go(_asstChatId);
+  else fetch('/crowd/api/chats', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) { go(d.id); }).catch(function() {});
 }
 
 // ── Zone config ────────────────────────────────────────────────────────────

@@ -116,6 +116,22 @@ CREATE TABLE IF NOT EXISTS cic_zone_readings (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cic_readings_zone ON cic_zone_readings(zone_id, created_at);
+
+-- CIC Assistant: persisted multi-turn operator chats
+CREATE TABLE IF NOT EXISTS cic_chats (
+    id          TEXT PRIMARY KEY,
+    title       TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cic_chat_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cic_chat_msgs ON cic_chat_messages(chat_id, id);
 """
 
 
@@ -410,6 +426,50 @@ class Database:
             c1 = conn.execute("DELETE FROM cic_alerts WHERE created_at < ?", (cutoff,)).rowcount
             c2 = conn.execute("DELETE FROM cic_zone_readings WHERE created_at < ?", (cutoff,)).rowcount
         return (c1 or 0) + (c2 or 0)
+
+    # ── CIC Assistant chats (multi-turn, persisted) ──────────────────────
+    def create_chat(self, chat_id: str, title: str = "New chat"):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO cic_chats (id, title, created_at, updated_at) VALUES (?,?,?,?)",
+                (chat_id, title, _now(), _now()),
+            )
+
+    def list_chats(self, limit: int = 100) -> list:
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM cic_chats ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()]
+
+    def get_chat_messages(self, chat_id: str) -> list:
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT role, content, created_at FROM cic_chat_messages "
+                "WHERE chat_id=? ORDER BY id ASC", (chat_id,)
+            ).fetchall()]
+
+    def add_chat_message(self, chat_id: str, role: str, content: str):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO cic_chat_messages (chat_id, role, content, created_at) "
+                "VALUES (?,?,?,?)", (chat_id, role, content, _now()),
+            )
+            conn.execute("UPDATE cic_chats SET updated_at=? WHERE id=?", (_now(), chat_id))
+
+    def rename_chat(self, chat_id: str, title: str):
+        with self._connect() as conn:
+            conn.execute("UPDATE cic_chats SET title=? WHERE id=?", (title, chat_id))
+
+    def delete_chat(self, chat_id: str):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM cic_chat_messages WHERE chat_id=?", (chat_id,))
+            conn.execute("DELETE FROM cic_chats WHERE id=?", (chat_id,))
+
+    def chat_exists(self, chat_id: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM cic_chats WHERE id=?", (chat_id,)
+            ).fetchone() is not None
 
 
 def _now() -> str:

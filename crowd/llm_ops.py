@@ -40,13 +40,27 @@ Guidelines:
 
 
 def _build_context(state: dict) -> str:
-    zones = state.get("zones", {})
-    total = state.get("total_count", 0)
+    zones  = state.get("zones", {})
     alerts = state.get("alerts", [])
+    # Describe ONLY zones with a live camera feed — not the static zones.json
+    # config. Otherwise the assistant always talks about all 4 zones (3 sitting
+    # at 0/SAFE) no matter what's actually running, giving generic, identical answers.
+    active     = {s.get("slot") for s in state.get("slots", []) if s.get("active")}
+    live_zones = {zid: z for zid, z in zones.items() if z.get("slot") in active}
 
-    lines = [f"Total persons detected across all cameras: {total}"]
-    lines.append("\nZone Status:")
-    for zid, z in zones.items():
+    if not live_zones:
+        return ("No camera feeds are currently active, so there is no live crowd "
+                "data to analyze. Advise the operator to start a camera in the "
+                "Cameras tab before requesting situational guidance.")
+
+    total = sum(z.get("count", 0) for z in live_zones.values())
+    lines = [
+        f"Active camera feeds: {len(live_zones)}",
+        f"Total persons detected (live feeds): {total}",
+        "",
+        "Zone Status:",
+    ]
+    for zid, z in live_zones.items():
         lines.append(
             f"  {z['name']}: {z['count']} persons, "
             f"density={z['density']:.3f} p/m², risk={z['risk'].upper()}"
@@ -91,4 +105,41 @@ def ask(question: str, state: dict, api_key: str) -> Iterator[str]:
                 yield text
     except Exception as e:
         logger.warning(f"LLM ask error: {e}")
+        yield f"[Error contacting Claude API: {e}]"
+
+
+def ask_chat(history: list, state: dict, api_key: str) -> Iterator[str]:
+    """
+    Multi-turn variant: stream a reply given the full conversation history
+    (list of {role, content}) plus the current crowd state. Live crowd data is
+    injected into the system prompt so every turn sees the latest numbers.
+    """
+    if not api_key:
+        yield "[LLM not configured — add ANTHROPIC_API_KEY to your .env file]"
+        return
+    try:
+        import anthropic
+    except ImportError:
+        yield "[anthropic SDK not installed — run: pip install anthropic]"
+        return
+
+    messages = [{"role": m["role"], "content": m["content"]}
+                for m in history
+                if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()]
+    if not messages:
+        return
+
+    try:
+        system = SYSTEM_PROMPT + "\n\n--- LIVE CROWD DATA (current) ---\n" + _build_context(state)
+        client = anthropic.Anthropic(api_key=api_key)
+        with client.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            system=system,
+            messages=messages,
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+    except Exception as e:
+        logger.warning(f"LLM ask_chat error: {e}")
         yield f"[Error contacting Claude API: {e}]"
