@@ -31,6 +31,11 @@ from typing import Optional
 
 from crowd.analyzer import CameraAnalyzer
 
+import config
+from storage.database import Database
+from crowd.persistence import should_persist_reading
+from crowd.notifier import build_notifiers_from_config, should_notify
+
 logger = logging.getLogger(__name__)
 
 _ZONES_PATH = Path(__file__).parent / "zones.json"
@@ -46,6 +51,17 @@ class Platform:
         self._zone_states = self._init_zone_states()
         self._alerts      = []          # list of alert dicts, newest first
         self._alert_ts    = {}          # (zone_id, alert_type) → last_alert_time
+        self._db          = Database()
+        self._reading_last_ts: dict = {}   # zone_id → last persisted reading time
+        try:
+            removed = self._db.prune_cic_data(getattr(config, "CIC_DATA_TTL_DAYS", 30))
+            if removed:
+                logger.info(f"CIC startup prune: removed {removed} expired alert/reading rows")
+        except Exception as e:
+            logger.warning(f"CIC startup prune failed: {e}")
+        self._notifiers = build_notifiers_from_config()
+        if self._notifiers:
+            logger.info(f"CIC notifiers active: {len(self._notifiers)}")
         self._subscribers: list = []
         self._running     = False
         self._thread: Optional[threading.Thread] = None
@@ -186,6 +202,12 @@ class Platform:
         with self._lock:
             return list(self._alerts[:limit])
 
+    def get_alert_history(self, limit: int = 100, since: str = "") -> list:
+        return self._db.get_cic_alerts(limit=limit, since=since)
+
+    def get_zone_history(self, zone_id: str = "", since: str = "") -> list:
+        return self._db.get_cic_readings(zone_id=zone_id, since=since)
+
     # ── SSE pub-sub ───────────────────────────────────────────────────────
 
     def subscribe(self) -> queue.Queue:
@@ -264,6 +286,42 @@ class Platform:
                         self._alerts.insert(0, alert)
                         self._alerts = self._alerts[:100]
                         new_alerts.append(alert)
+                        try:
+                            self._db.insert_cic_alert(alert)
+                        except Exception as e:
+                            logger.warning(f"persist alert failed: {e}")
+                        if self._notifiers:
+                            min_sev = getattr(config, "CIC_WEBHOOK_MIN_SEVERITY", "high")
+                            if should_notify(alert.get("severity", ""), min_sev):
+                                ctx = {"venue": self._zones_raw.get("venue", {}),
+                                       "zone": {"id": zid, "name": zs["name"]}}
+                                for n in self._notifiers:
+                                    threading.Thread(target=n.send, args=(alert, ctx),
+                                                     daemon=True, name="CIC-notify").start()
+                        if (getattr(config, "CIC_CLIPS_ENABLED", True)
+                                and alert.get("severity") in ("high", "critical")):
+                            a = self._analyzers.get(meta.get("slot"))
+                            if a is not None:
+                                _uid = alert.get("id")
+                                a.record_incident(
+                                    lambda p, u=_uid: self._db.update_cic_alert_clip(u, p))
+
+                    # Downsampled zone-reading persistence (+ on risk transition)
+                    now_ts = time.time()
+                    if should_persist_reading(
+                        now_ts, self._reading_last_ts.get(zid, 0.0),
+                        risk, prev_risk,
+                        getattr(config, "CIC_READING_PERSIST_S", 10),
+                    ):
+                        self._reading_last_ts[zid] = now_ts
+                        try:
+                            self._db.insert_cic_reading({
+                                "zone_id": zid, "zone_name": zs["name"],
+                                "count": meta["count"], "density": meta["density"],
+                                "risk": risk, "n_suspicious": meta.get("n_suspicious", 0),
+                            })
+                        except Exception as e:
+                            logger.warning(f"persist reading failed: {e}")
 
             # Broadcast update
             state_snap = self.get_state()

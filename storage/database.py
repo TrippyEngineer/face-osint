@@ -86,6 +86,36 @@ CREATE TABLE IF NOT EXISTS cic_face_captures (
 );
 CREATE INDEX IF NOT EXISTS idx_cic_cap_track  ON cic_face_captures(track_id);
 CREATE INDEX IF NOT EXISTS idx_cic_cap_slot   ON cic_face_captures(slot_id);
+
+-- CIC Phase 4: persisted alerts + zone readings (survive restart)
+CREATE TABLE IF NOT EXISTS cic_alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_uid   TEXT,
+    zone_id     TEXT NOT NULL,
+    zone_name   TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    message     TEXT,
+    density     REAL,
+    count       INTEGER,
+    clip_path   TEXT,
+    acked       INTEGER DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cic_alerts_zone ON cic_alerts(zone_id);
+CREATE INDEX IF NOT EXISTS idx_cic_alerts_time ON cic_alerts(created_at);
+
+CREATE TABLE IF NOT EXISTS cic_zone_readings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id      TEXT NOT NULL,
+    zone_name    TEXT NOT NULL,
+    count        INTEGER,
+    density      REAL,
+    risk         TEXT,
+    n_suspicious INTEGER,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cic_readings_zone ON cic_zone_readings(zone_id, created_at);
 """
 
 
@@ -319,6 +349,67 @@ class Database:
     def get_cic_capture_count(self) -> int:
         with self._connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM cic_face_captures").fetchone()[0]
+
+    # ── CIC Phase 4: alerts + readings ────────────────────────────────────
+    def insert_cic_alert(self, alert: dict):
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO cic_alerts
+                   (alert_uid, zone_id, zone_name, type, severity, message,
+                    density, count, clip_path, acked, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (alert.get("id"), alert.get("zone_id"),
+                 alert.get("zone") or alert.get("zone_name"),
+                 alert.get("type"), alert.get("severity"), alert.get("message"),
+                 alert.get("density"), alert.get("count"),
+                 alert.get("clip_path"), 1 if alert.get("acked") else 0, _now()),
+            )
+
+    def update_cic_alert_clip(self, alert_uid: str, clip_path: str):
+        with self._connect() as conn:
+            conn.execute("UPDATE cic_alerts SET clip_path=? WHERE alert_uid=?",
+                         (clip_path, alert_uid))
+
+    def get_cic_alerts(self, limit: int = 100, since: str = "") -> list:
+        q = "SELECT * FROM cic_alerts"
+        args: tuple = ()
+        if since:
+            q += " WHERE created_at >= ?"; args = (since,)
+        q += " ORDER BY created_at DESC LIMIT ?"; args = args + (limit,)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(q, args).fetchall()]
+
+    def insert_cic_reading(self, reading: dict):
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO cic_zone_readings
+                   (zone_id, zone_name, count, density, risk, n_suspicious, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (reading.get("zone_id"), reading.get("zone_name"),
+                 reading.get("count"), reading.get("density"),
+                 reading.get("risk"), reading.get("n_suspicious", 0), _now()),
+            )
+
+    def get_cic_readings(self, zone_id: str = "", since: str = "") -> list:
+        q = "SELECT * FROM cic_zone_readings"
+        clauses, args = [], []
+        if zone_id:
+            clauses.append("zone_id=?"); args.append(zone_id)
+        if since:
+            clauses.append("created_at >= ?"); args.append(since)
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY created_at ASC"
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(q, tuple(args)).fetchall()]
+
+    def prune_cic_data(self, ttl_days: int) -> int:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as conn:
+            c1 = conn.execute("DELETE FROM cic_alerts WHERE created_at < ?", (cutoff,)).rowcount
+            c2 = conn.execute("DELETE FROM cic_zone_readings WHERE created_at < ?", (cutoff,)).rowcount
+        return (c1 or 0) + (c2 or 0)
 
 
 def _now() -> str:

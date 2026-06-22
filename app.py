@@ -905,6 +905,18 @@ def cic_zones():
 def cic_status():
     return jsonify(get_platform().get_state())
 
+@app.route("/crowd/api/alerts/history")
+def cic_alerts_history():
+    limit = int(request.args.get("limit", 100))
+    since = request.args.get("since", "")
+    return jsonify(alerts=get_platform().get_alert_history(limit=limit, since=since))
+
+@app.route("/crowd/api/zones/history")
+def cic_zones_history():
+    zone_id = request.args.get("zone_id", "")
+    since   = request.args.get("since", "")
+    return jsonify(readings=get_platform().get_zone_history(zone_id=zone_id, since=since))
+
 @app.route("/crowd/api/stream")
 def cic_stream():
     plat = get_platform()

@@ -16,6 +16,7 @@ import base64
 import logging
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 import cv2
@@ -57,6 +58,9 @@ class CameraAnalyzer:
         self._person_hist:     dict = {}
         self._last_meta:       dict = {}
         self._last_frame:      Optional[np.ndarray] = None
+        self._clip_fps   = INFERENCE_FPS
+        self._clip_buf   = deque(maxlen=getattr(config, "CIC_CLIP_PRE_S", 10) * INFERENCE_FPS)
+        self._recording  = False
         self._prev_gray:       Optional[np.ndarray] = None
         self._flow_counter     = 0
         self._frame_count      = 0
@@ -126,6 +130,46 @@ class CameraAnalyzer:
         with self._lock:
             return dict(self._last_meta)
 
+    def record_incident(self, on_done) -> bool:
+        """Snapshot the pre-buffer, keep appending for CIC_CLIP_POST_S, encode an
+        mp4 in a background thread, then call on_done(path:str). Returns False if a
+        recording is already in flight or clips disabled."""
+        if not getattr(config, "CIC_CLIPS_ENABLED", True):
+            return False
+        with self._lock:
+            if self._recording:
+                return False
+            self._recording = True
+            pre = list(self._clip_buf)
+
+        def _worker():
+            from crowd.clip import incident_clip_path, write_clip
+            post_n = getattr(config, "CIC_CLIP_POST_S", 10) * self._clip_fps
+            collected = []
+            for _ in range(post_n):
+                with self._lock:
+                    if not self._active:
+                        break
+                    lf = self._last_frame
+                if lf is not None:
+                    collected.append(lf.copy())
+                time.sleep(1.0 / self._clip_fps)
+            frames = pre + collected
+            path = incident_clip_path(getattr(config, "CIC_INCIDENT_DIR"),
+                                      self.zone_cfg.get("id", f"zone_{self.slot_id}"))
+            ok = write_clip(frames, path, self._clip_fps)
+            with self._lock:
+                self._recording = False
+            if ok:
+                try:
+                    on_done(str(path))
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True,
+                         name=f"CIC-clip{self.slot_id}").start()
+        return True
+
     # ── Background thread ─────────────────────────────────────────────────
 
     def _stop_locked(self):
@@ -172,6 +216,12 @@ class CameraAnalyzer:
             if _scale < 1.0:
                 frame = cv2.resize(frame, (int(_w0 * _scale), int(_h0 * _scale)))
             self._frame_count += 1
+
+            # Buffer raw (pre-overlay) frames for incident clips
+            try:
+                self._clip_buf.append(frame.copy())
+            except Exception:
+                pass
 
             try:
                 meta, annotated = self._analyze(frame)
@@ -244,8 +294,36 @@ class CameraAnalyzer:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         flow_data = self._compute_flow(gray)
 
+        # Dense-crowd tiling: recount via overlapping tiles (config-gated).
+        # Full-frame track() above still drives behavior flags + track IDs;
+        # tiling only produces a more accurate count/density/heatmap.
+        tiled_centers = None
+        if model is not None and getattr(config, "CIC_TILING", False):
+            try:
+                from crowd.tiling import generate_tiles, merge_boxes
+                tiles = generate_tiles(w, h,
+                                       getattr(config, "CIC_TILE_GRID", "2x2"),
+                                       getattr(config, "CIC_TILE_OVERLAP", 0.2))
+                tboxes = []
+                for (tx1, ty1, tx2, ty2) in tiles:
+                    sub = frame[ty1:ty2, tx1:tx2]
+                    if sub.size == 0:
+                        continue
+                    res = model(sub, classes=[0], verbose=False,
+                                conf=getattr(config, "CIC_YOLO_CONF", 0.25),
+                                max_det=getattr(config, "CIC_MAX_DET", 1000))
+                    if res and res[0].boxes is not None:
+                        for b in res[0].boxes:
+                            x1, y1, x2, y2 = b.xyxy[0].tolist()
+                            tboxes.append((x1 + tx1, y1 + ty1, x2 + tx1, y2 + ty1,
+                                           float(b.conf[0])))
+                merged = merge_boxes(tboxes, getattr(config, "CIC_TILE_NMS_IOU", 0.5))
+                tiled_centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in merged]
+            except Exception as e:
+                logger.debug(f"Slot {self.slot_id} tiling error: {e}")
+
         # Zone density + risk
-        count    = len(detections)
+        count    = len(tiled_centers) if tiled_centers is not None else len(detections)
         # Density must use the camera's visible area, not the whole zone area,
         # otherwise count/area is microscopic and risk never escalates.
         fov_area = self.zone_cfg.get("fov_area_m2") or getattr(config, "CIC_FOV_AREA_M2", 100.0)
@@ -275,8 +353,9 @@ class CameraAnalyzer:
             "n_children":    n_children,
             # Person coordinates for heat map (normalized 0-1)
             "heatmap_pts": [
-                [round(d["center"][0] / w, 3), round(d["center"][1] / h, 3)]
-                for d in detections
+                [round(cx / w, 3), round(cy / h, 3)]
+                for (cx, cy) in (tiled_centers if tiled_centers is not None
+                                 else [d["center"] for d in detections])
             ],
         }
 

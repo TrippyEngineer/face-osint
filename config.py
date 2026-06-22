@@ -178,6 +178,31 @@ CIC_RUNNING_SPEED      = 18.0   # px/frame velocity to flag "running"
 CIC_FACE_MIN_CROP_PX   = 70     # skip Khoya-Paya capture for crops smaller than this
 
 
+# ── CIC Phase 4: persistence / retention ────────────────────────────────────
+CIC_READING_PERSIST_S = 10     # min seconds between persisted zone-reading snapshots
+CIC_DATA_TTL_DAYS     = 30     # prune cic_alerts / cic_zone_readings older than this
+
+# ── CIC Phase 4: outbound webhook notifications ─────────────────────────────
+CIC_WEBHOOK_URL          = os.getenv("CIC_WEBHOOK_URL", "")               # empty → disabled
+CIC_WEBHOOK_MIN_SEVERITY = os.getenv("CIC_WEBHOOK_MIN_SEVERITY", "high")  # warning|high|critical
+CIC_WEBHOOK_HEADERS      = os.getenv("CIC_WEBHOOK_HEADERS", "")           # optional JSON string
+CIC_WEBHOOK_TIMEOUT_S    = int(os.getenv("CIC_WEBHOOK_TIMEOUT_S", "6"))
+CIC_DISCORD_WEBHOOK_URL  = os.getenv("CIC_DISCORD_WEBHOOK_URL", "")       # Discord channel webhook
+
+# ── CIC Phase 4: incident clips ─────────────────────────────────────────────
+CIC_CLIPS_ENABLED = os.getenv("CIC_CLIPS_ENABLED", "1") not in ("0", "false", "False")
+CIC_CLIP_PRE_S    = int(os.getenv("CIC_CLIP_PRE_S", "10"))
+CIC_CLIP_POST_S   = int(os.getenv("CIC_CLIP_POST_S", "10"))
+CIC_INCIDENT_DIR  = OUTPUT_DIR / "cic_incidents"
+CIC_INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── CIC Phase 4: dense-crowd tiling ─────────────────────────────────────────
+CIC_TILING       = os.getenv("CIC_TILING", "0") in ("1", "true", "True")
+CIC_TILE_GRID    = os.getenv("CIC_TILE_GRID", "2x2")
+CIC_TILE_OVERLAP = float(os.getenv("CIC_TILE_OVERLAP", "0.2"))
+CIC_TILE_NMS_IOU = float(os.getenv("CIC_TILE_NMS_IOU", "0.5"))
+
+
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  WEB / UPLOAD                                                        ║
 # ╚══════════════════════════════════════════════════════════════════════╝
