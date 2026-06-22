@@ -153,13 +153,25 @@ def _dedup_profiles(profiles: list) -> list:
 def _edge_weight(a: dict, b: dict) -> float:
     w = 0.0
 
-    # Face score agreement
     fa, fb = a.get("face_score"), b.get("face_score")
-    if fa is not None and fb is not None:
+
+    # Face VETO: if both have a face score and they actively contradict (one is
+    # a match, the other clearly rejected) they are NOT the same person — never
+    # merge, no matter how well name/email/employer line up. Stops same-name
+    # strangers (e.g. a namesake whose face scored 0.19) from being fused into a
+    # face-confirmed identity and leaking their contact details into it.
+    if (fa is not None and fb is not None
+            and max(fa, fb) >= config.FACE_POSSIBLE
+            and min(fa, fb) < config.FACE_REJECTED):
+        return 0.0
+
+    # Face score agreement (only when BOTH are at least a possible match)
+    if (fa is not None and fb is not None
+            and min(fa, fb) >= config.FACE_POSSIBLE):
         avg = (fa + fb) / 2.0
         if avg >= config.FACE_CONFIRMED:
             w = max(w, 1.00)
-        elif avg >= config.FACE_POSSIBLE:
+        else:
             w = max(w, 0.60)
 
     # Email exact match
@@ -199,27 +211,56 @@ def _edge_weight(a: dict, b: dict) -> float:
     return w
 
 
+def _clean_name(p: dict) -> str:
+    """Strip title suffixes like ' - Programme officer' / ' | LinkedIn'."""
+    nm = (p.get("name") or p.get("username") or "").strip()
+    for sep in (" - ", " | ", " – ", " — "):
+        nm = nm.split(sep)[0]
+    return nm.strip()
+
+
 def _merge(query_name: str, profiles: list) -> dict:
-    best = max(profiles, key=lambda p: p.get("combined_score", 0))
+    # Identity is FACE-anchored: only face-verified profiles define who this is.
+    verified = [p for p in profiles
+                if p.get("face_verified") or (p.get("face_score") or 0) >= config.FACE_POSSIBLE]
+    # Among verified, prefer those whose name actually matches the query — drops
+    # face-similar connections / look-alikes (e.g. "Pujya Ghosh") from driving
+    # the identity's name + contact details.
+    qn = (query_name or "").lower().strip()
+    name_consistent = [p for p in verified
+                       if qn and _ratio(qn, _clean_name(p).lower()) >= 0.6]
+    core = name_consistent or verified or profiles   # graceful fallback (name-only clusters)
+
+    best = max(core, key=lambda p: (p.get("face_score") or 0.0, p.get("combined_score", 0)))
 
     urls    = list({p.get("url") or p.get("profile_url") or "" for p in profiles if p.get("url") or p.get("profile_url")})
     sources = list({p.get("source", "") for p in profiles if p.get("source")})
-    faces   = [p["face_score"] for p in profiles if p.get("face_score") is not None]
+    faces   = ([p["face_score"] for p in verified if p.get("face_score") is not None]
+               or [p["face_score"] for p in profiles if p.get("face_score") is not None])
+
+    # A face match alone (especially reverse-image look-alikes) is a *candidate*,
+    # not proof. Only call it CONFIRMED when the query NAME corroborates the face;
+    # for a photo-only search or a name mismatch, cap the verdict at POSSIBLE.
+    verdict = best.get("verdict", "possible")
+    if verdict == "confirmed" and not name_consistent:
+        verdict = "possible"
 
     return {
         "query_name":     query_name,
-        "resolved_name":  best.get("name") or best.get("username") or query_name,
+        "resolved_name":  _clean_name(best) or query_name,
         "face_score":     max(faces) if faces else None,
-        "combined_score": max(p.get("combined_score", 0) for p in profiles),
-        "verdict":        best.get("verdict", "possible"),
+        "combined_score": max((p.get("combined_score", 0) for p in core), default=0.0),
+        "verdict":        verdict,
         "sources":        sources,
         "profile_urls":   [u for u in urls if u],
-        "email":          _first(profiles, "email"),
-        "company":        _first(profiles, "company") or _first(profiles, "affiliation"),
-        "location":       _first(profiles, "location"),
-        "username":       _first(profiles, "username"),
-        "bio":            _first(profiles, "bio"),
-        "photo_url":      _first(profiles, "photo_url") or _first(profiles, "avatar_url"),
+        # contact/identity fields come ONLY from the core (face-verified,
+        # query-consistent) profiles — never from same-name strangers.
+        "email":          _first(core, "email"),
+        "company":        _first(core, "company") or _first(core, "affiliation"),
+        "location":       _first(core, "location"),
+        "username":       _first(core, "username"),
+        "bio":            _first(core, "bio"),
+        "photo_url":      _first(core, "photo_url") or _first(core, "avatar_url"),
         "all_profiles":   profiles,
     }
 

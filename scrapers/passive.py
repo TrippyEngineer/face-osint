@@ -42,7 +42,6 @@ def scrape(context: dict) -> dict:
     for fn, key, label in [
         (_wayback,         "wayback_urls",    "Wayback Machine"),
         (_gdelt,           "gdelt_mentions",  "GDELT News"),
-        (_crt_sh,          "crt_domains",     "crt.sh"),
         (_pgp,             "pgp_keys",        "PGP keyservers"),
     ]:
         try:
@@ -62,8 +61,8 @@ def scrape(context: dict) -> dict:
             results["twitter_history"].extend(hist)
             break
 
-    # Wayback archived tweets
-    results["wayback_tweets"] = _wayback_twitter(name, variants)
+    # Wayback archived tweets — dropped: timetravel.mementoweb.org fails DNS and
+    # stalls passive past its 20s deadline (wayback_tweets stays [] from init).
 
     # Gravatar (no email needed — try name variants as email prefixes)
     for uname in variants[:3]:

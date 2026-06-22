@@ -219,39 +219,55 @@ def run_search(sid: str, frame: np.ndarray, name: str,
         if cancelled(): return
 
         # ── Build context with location + company ─────────────────────
+        # ── High-res query image for reverse-image search ─────────────
+        # FIX: reverse_face previously received face_crop.jpg, which is the
+        # 160x160 Facenet *embedding* crop — Lens/Bing/SerpApi were searching a
+        # tiny upscaled thumbnail and returned wrong people. Send a native-
+        # resolution face crop instead (falls back to full frame).
+        search_img   = embedding.hires_face_crop(frame, res.get("bbox"))
+        _sok, _sbuf  = cv2.imencode(".jpg", search_img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if _sok:
+            cv2.imwrite(str(folder / "face_query.jpg"), search_img)   # report/debug
+            _search_b64 = "data:image/jpeg;base64," + base64.b64encode(_sbuf.tobytes()).decode()
+        else:
+            _search_b64 = ""
+        log("INFO", "reverse_face",
+            f"Reverse-search query image: {search_img.shape[1]}x{search_img.shape[0]}px "
+            f"(was 160x160 face_crop)",
+            {"w": int(search_img.shape[1]), "h": int(search_img.shape[0])})
+
         ctx = {
             "name":           name,
             "company":        company,
             "location":       location,
             "embedding":      emb_vec,
             "face_crop_path": str(folder / "face_crop.jpg"),
-            # image_b64: face crop as base64 JPEG — used by reverse_face.py
-            # (reads from the saved face_crop.jpg so the context stays JSON-safe)
-            "image_b64": (lambda p: (
-                "data:image/jpeg;base64," + base64.b64encode(p.read_bytes()).decode()
-                if p.exists() else ""
-            ))(folder / "face_crop.jpg"),
+            # image_b64: HIGH-RES face crop (NOT the 160px embedding crop) — this
+            # is the image reverse_face.py uploads to Lens / Bing / SerpApi.
+            "image_b64":      _search_b64,
         }
 
         # (label, module, function, context, per-scraper timeout seconds)
         # reverse_face needs ~60-80s (4 search engines + face-verify batch)
         # username needs ~35-50s (125 direct checks + Sherlock)
         # All others finish well within 30s.
+        # Face is always the query. Name-based sources only run WHEN a name is
+        # given — without one they search "" and return false/garbage hits
+        # (e.g. OpenAlex returns unrelated authors for an empty query).
         SCRAPERS = [
-            # ── STAGE 1: Face is the query — runs first ────────────────────
             ("reverse_face",   "scrapers.reverse_face",  "scrape",        ctx, 90),
-            # ── STAGE 2: Platform APIs ─────────────────────────────────────
-            ("github",         "scrapers.platforms",      "scrape_github", ctx, 20),
-            ("reddit",         "scrapers.platforms",      "scrape_reddit", ctx, 15),
-            # ── STAGE 3: Broad text + academic sources ─────────────────────
-            ("search_engines", "scrapers.search_engines", "scrape",        ctx, 25),
-            ("academic",       "scrapers.academic",       "scrape",        ctx, 35),
-            # ── STAGE 4: Passive + username intelligence ────────────────────
-            ("passive",        "scrapers.passive",        "scrape",        ctx, 20),
-            ("username",       "scrapers.username",       "scrape",        ctx, 50),
-            # Note: gitlab (403 without token) and npm removed — add back
-            # if you set GITLAB_TOKEN in .env
         ]
+        if name:
+            SCRAPERS += [
+                ("github",         "scrapers.platforms",      "scrape_github", ctx, 20),
+                ("reddit",         "scrapers.platforms",      "scrape_reddit", ctx, 15),
+                ("search_engines", "scrapers.search_engines", "scrape",        ctx, 25),
+                ("academic",       "scrapers.academic",       "scrape",        ctx, 35),
+                ("passive",        "scrapers.passive",        "scrape",        ctx, 20),
+                ("username",       "scrapers.username",       "scrape",        ctx, 50),
+                # Note: gitlab (403 without token) and npm removed — add back
+                # if you set GITLAB_TOKEN in .env
+            ]
 
         # ── Step 4: Scraping ──────────────────────────────────────────
         push(step="scraping", msg=f"Launching {len(SCRAPERS)} sources…")
@@ -615,7 +631,7 @@ def api_search():
     d        = request.get_json() or {}
     raw_name = (d.get("name") or "").strip()
     img      = d.get("image", "")
-    if not raw_name: return jsonify(error="Name required"), 400
+    # name is optional — a photo alone is a valid (face-only) search
     if len(raw_name) > 200: return jsonify(error="Name too long (max 200 characters)"), 400
     if not img:      return jsonify(error="Image required"), 400
 
@@ -751,7 +767,9 @@ def api_search_face_crop(sid):
     if not fc.exists():
         return jsonify(error="Face crop not found"), 404
     from flask import send_file
-    return send_file(str(fc), mimetype="image/jpeg")
+    resp = send_file(str(fc), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-store"   # always serve the current face, never a stale cached one
+    return resp
 
 @app.route("/api/files/<sid>")
 def api_files(sid):
@@ -910,6 +928,19 @@ def cic_alerts_history():
     limit = int(request.args.get("limit", 100))
     since = request.args.get("since", "")
     return jsonify(alerts=get_platform().get_alert_history(limit=limit, since=since))
+
+@app.route("/crowd/api/incident_clip/<path:filename>")
+def cic_incident_clip(filename):
+    """Serve a recorded incident clip from CIC_INCIDENT_DIR (basename only — no path traversal)."""
+    from werkzeug.utils import secure_filename
+    from flask import send_file
+    safe = secure_filename(filename)
+    if not safe.endswith(".mp4"):
+        return jsonify(error="Not a clip"), 400
+    path = config.CIC_INCIDENT_DIR / safe
+    if not path.exists():
+        return jsonify(error="Clip not found"), 404
+    return send_file(str(path), mimetype="video/mp4")
 
 @app.route("/crowd/api/zones/history")
 def cic_zones_history():
@@ -2389,6 +2420,9 @@ body{
   <!-- Tab 3: Alerts + LLM SOP assistant -->
   <div class="cic-panel" id="cic-panel-alerts">
     <div class="cic-alerts-layout">
+      <div id="cic-clip-list" style="flex:none;max-height:130px;overflow-y:auto;border-bottom:1px solid var(--border);padding:8px">
+        <div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>
+      </div>
       <div class="cic-alert-log" id="cic-alert-log">
         <div style="color:var(--text-muted);font-size:12px;padding:12px">No alerts &mdash; monitoring active zones&hellip;</div>
       </div>
@@ -2878,7 +2912,7 @@ function switchTab(tab){
 // ISSUE 2: check face before search, show modal if repeat
 async function startSearch(){
   const nameRaw=document.getElementById('name-in').value.trim();
-  if(!nameRaw){toast('Enter a name first','er');document.getElementById('name-in').focus();return;}
+  // name is optional — a photo alone is a valid (face-only) search
   if(!captured){toast('Capture or upload a photo first','er');return;}
 
   // Check for repeat face
@@ -2935,6 +2969,7 @@ async function doSearch(nameRaw){
   const _fwb=document.getElementById('face-warn-banner');if(_fwb)_fwb.classList.remove('show');
   const _rtb=document.getElementById('res-toolbar');if(_rtb)_rtb.style.display='none';
   const _qw=document.getElementById('qface-wrap');if(_qw)_qw.style.display='none';
+  const _qi=document.getElementById('qface-img');if(_qi)_qi.src='';
   const _dlb=document.getElementById('btn-dl-report');if(_dlb)_dlb.style.display='none';
   const _sfw=document.getElementById('score-filter-wrap');if(_sfw)_sfw.style.display='none';
   // Reset live feed
@@ -2989,12 +3024,32 @@ function openSSE(sid,name){
     if(m.done){es.close();es=null;}
   };
   es.onerror=()=>{
-    // Close immediately — do NOT let EventSource auto-reconnect
-    // (auto-reconnect would re-open the stream after the search finishes,
-    //  or keep spamming a 404 if the queue is already cleaned up)
+    // Close immediately — do NOT let EventSource auto-reconnect.
     if(es){es.close();es=null;}
-    setUI(true);
+    // onerror fires only on a real drop BEFORE 'done' (we close cleanly on
+    // 'done' in onmessage). Long searches sometimes drop the browser's
+    // EventSource; the backend finishes regardless, so recover by polling the
+    // saved result and rendering it (no result is lost).
+    if(curSid){ _pollResult(curSid); } else { setUI(true); }
   };
+}
+
+// Recover from a dropped live stream: poll the saved result until the search is
+// done, then render it from disk (same path as opening a search from History).
+async function _pollResult(sid){
+  setStatus('busy','Connection dropped — finishing in background…');
+  for(let i=0;i<60;i++){            // up to ~3 min
+    await new Promise(r=>setTimeout(r,3000));
+    try{
+      const r=await fetch('/api/result/'+sid);
+      if(r.ok){
+        const d=await r.json();
+        if((d.status||'')==='done'){ setUI(true); await viewRep(sid,d.name||''); return; }
+      }
+    }catch(e){}
+  }
+  setUI(true);
+  setStatus('err','Search finished but the live view dropped — open it from History.');
 }
 
 // ── Live feed ─────────────────────────────────────────────────────────────
@@ -3261,7 +3316,8 @@ function buildResults(m,name){
   const ss=m.source_summary||{};
   const urls=(id.profile_urls||[]).filter(Boolean);
   const maxN=Math.max(1,...Object.values(ss).map(s=>s.count||0));
-  const allMatches = (m.all_matches||[]).slice().sort((a,b)=>(b.combined_score||0)-(a.combined_score||0));
+  // C: show only the face-matched person — drop same-name strangers (name-only matches the face engine did NOT verify)
+  const allMatches = (m.all_matches||[]).filter(x=>x.face_verified).slice().sort((a,b)=>(b.combined_score||0)-(a.combined_score||0));
 
   const srcHtml=Object.entries(ss).map(([lbl,s])=>{
     const n=s.count||0,ok=!s.error;
@@ -3298,7 +3354,7 @@ function buildResults(m,name){
           `<div class="id-name">${esc(id.resolved_name||name)}</div>` +
           `<div class="id-badges">` +
             `<span class="vb ${vc}">${esc(vLabel.toUpperCase())}</span>` +
-            (m.total ? `<span style="font-size:10px;color:var(--text-muted)">${m.total} results</span>` : '') +
+            (allMatches.length ? `<span style="font-size:10px;color:var(--text-muted)">${allMatches.length} results</span>` : '') +
             ((id.sources||[]).length ? `<span style="font-size:10px;color:var(--text-muted)">${id.sources.length} sources</span>` : '') +
           `</div>` +
         `</div>` +
@@ -3456,49 +3512,39 @@ async function viewRep(sid,name){
   switchTab('res');
   document.getElementById('res-panel').innerHTML='<div class="wait"><div class="wait-ic">&#8987;</div><div class="wait-t">Loading\u2026</div></div>';
   try{
-    // Fetch structured result data
     const r=await fetch('/api/result/'+sid);
     if(!r.ok) throw new Error('Not found');
     const data=await r.json();
-
-    // Build a synthetic "done" message compatible with buildResults
-    const matches_raw = data.matches||[];
-    const identity = {
-      resolved_name: data.name||name,
-      verdict: data.verdict||'unknown',
-      combined_score: data.combined_score||0,
-      photo_url: data.photo_url||'',
-      email: data.email||'',
-      company: data.company||'',
-      location: data.location||'',
-      bio: data.bio||'',
-      profile_urls: matches_raw.filter(m=>m.url&&(m.platform||'').match(/LinkedIn|GitHub|Twitter|Instagram|ResearchGate/i)).map(m=>m.url).filter(Boolean).slice(0,10),
-      sources: [...new Set(matches_raw.map(m=>m.source).filter(Boolean))],
+    // /api/result returns the full matches_summary.json under `data.matches`
+    // (an object: {identity, results}), NOT an array.
+    const summary = data.matches || {};
+    // Use the SAVED resolved identity (face-anchored) — not a reconstruction.
+    const identity = summary.identity || {
+      resolved_name: data.name||name, verdict: data.verdict||'unknown',
+      combined_score: data.combined_score||0, profile_urls: [], sources: [],
     };
-    // Best photo: face-verified match photo or face crop
-    const fvMatch = matches_raw.find(m=>m.face_verified&&m.photo_url);
-    if(fvMatch&&!identity.photo_url) identity.photo_url=fvMatch.photo_url;
-
+    const results = summary.results || {};          // { source: [matches] }
+    const all_matches = (identity.all_profiles && identity.all_profiles.length)
+      ? identity.all_profiles
+      : [].concat(...Object.values(results));
     const source_summary = {};
-    matches_raw.forEach(m=>{
-      const s=m.source||'unknown';
-      if(!source_summary[s]) source_summary[s]={count:0};
-      source_summary[s].count++;
-    });
+    Object.entries(results).forEach(([s,arr])=>{ source_summary[s]={count:(arr||[]).length}; });
 
     buildResults({
       identity,
-      total: matches_raw.length,
+      total: all_matches.length,
       source_summary,
       folder: data.output_folder||'',
       face_crop_b64: data.face_crop_b64||'',
-      all_matches: matches_raw,
-    }, data.name||name);
+      all_matches,
+    }, identity.resolved_name||data.name||name);
 
-    // Also show files
     const fr=await(await fetch('/api/files/'+sid)).json();
     if(fr.files) showFiles(fr.files);
-  }catch(e){ toast('Cannot load report: '+e.message,'er'); }
+  }catch(e){
+    document.getElementById('res-panel').innerHTML='<div class="wait"><div class="wait-t">Could not load this search.</div></div>';
+    toast('Cannot load report: '+e.message,'er');
+  }
 }
 
 // Feature A: score filter — toggle visibility of match cards below threshold
@@ -3630,6 +3676,22 @@ function cicTab(name) {
   if (name === 'analytics' && !_cicBarChart) {
     setTimeout(_cicInitCharts, 50);
   }
+  if (name === 'alerts') { _cicLoadClips(); }
+}
+
+// Incident clips: list recorded clips (from persisted alert history) with links
+function _cicLoadClips() {
+  fetch('/crowd/api/alerts/history?limit=50').then(function(r){return r.json();}).then(function(d){
+    var el = document.getElementById('cic-clip-list');
+    if(!el) return;
+    var clips = (d.alerts||[]).filter(function(a){return a.clip_path;});
+    if(!clips.length){ el.innerHTML='<div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>'; return; }
+    el.innerHTML = '<div style="font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin-bottom:4px">&#128249; Incident Clips</div>' +
+      clips.map(function(a){
+        var f = String(a.clip_path||'').replace(/\\/g,'/').split('/').pop();
+        return '<div style="font-size:11px;padding:3px 0"><a href="/crowd/api/incident_clip/'+encodeURIComponent(f)+'" target="_blank" rel="noopener" class="result-link">&#128249; '+esc(a.zone_name||a.zone||'zone')+' &middot; '+esc(String(a.severity||'').toUpperCase())+' &middot; '+esc(a.created_at||'')+'</a></div>';
+      }).join('');
+  }).catch(function(){});
 }
 
 // ── Zone config ────────────────────────────────────────────────────────────

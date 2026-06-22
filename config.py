@@ -69,6 +69,9 @@ DEEPFACE_ENFORCE  = False            # don't crash if no face detected
 FACE_CONFIRMED  = 0.68   # high confidence — same person
 FACE_POSSIBLE   = 0.50   # possible match — review manually
 FACE_REJECTED   = 0.35   # different person — discard
+# Skip face-matching candidate images smaller than this on the long side —
+# favicons/thumbnails (e.g. 32x32) embed to noise and yield spurious high scores.
+FACE_MATCH_MIN_PX = 120
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗

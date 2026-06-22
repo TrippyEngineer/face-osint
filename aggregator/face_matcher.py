@@ -98,6 +98,10 @@ def _score_url(url: str, query_embedding: np.ndarray) -> Optional[float]:
         frame     = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if frame is None:
             return None
+        # Skip tiny thumbnails / favicons (e.g. 32x32): their embeddings are
+        # noise and produce spurious high similarity scores.
+        if max(frame.shape[:2]) < getattr(config, "FACE_MATCH_MIN_PX", 120):
+            return None
 
         result = emb_module.extract(frame)
         if result is None:

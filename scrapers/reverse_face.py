@@ -571,28 +571,36 @@ def _enrich(match: dict) -> dict:
 #  ENGINE 6 — Playwright Google Lens (free, no API key, no image hosting)
 # ══════════════════════════════════════════════════════════════════════════
 def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
-    """
-    Google Lens via headless Chromium. No SerpApi key needed.
-    Uses Google Images camera icon → expect_file_chooser() to intercept the
-    native OS file dialog, then parses the visual match results page.
-    """
+    """Google Lens via headless Chromium. No SerpApi key needed.
+
+    Runs the Playwright ASYNC API in this worker thread's own event loop via
+    asyncio.run() — the supported way to drive Playwright from a thread. The old
+    sync API used a process-global driver that intermittently raised
+    'This event loop is already running' when Lens + Bing ran in parallel."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import async_playwright  # noqa: F401
     except ImportError:
         logger.info("playwright not installed — skipping Lens (pip install playwright && playwright install chromium)")
         return [], []
+    try:
+        return asyncio.run(_lens_async(img_bytes))
+    except Exception as e:
+        logger.warning(f"Playwright Google Lens: {e}")
+        return [], []
+
+
+async def _lens_async(img_bytes: bytes) -> tuple[list[dict], list[str]]:
+    from playwright.async_api import async_playwright
 
     matches, names, seen = [], [], set()
     tmp_path = None
-    # Give each thread its own event loop so parallel invocations don't conflict
-    asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             f.write(img_bytes)
             tmp_path = f.name
 
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
@@ -600,7 +608,7 @@ def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
-            ctx = browser.new_context(
+            ctx = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -609,27 +617,28 @@ def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
             )
-            page = ctx.new_page()
+            page = await ctx.new_page()
             page.set_default_timeout(15000)
 
             # Google Images homepage → click camera icon (visual search)
-            page.goto("https://images.google.com/", timeout=15000, wait_until="domcontentloaded")
-            page.click('[aria-label="Search by image"]', timeout=8000)
-            page.wait_for_timeout(800)
+            await page.goto("https://images.google.com/", timeout=15000, wait_until="domcontentloaded")
+            await page.click('[aria-label="Search by image"]', timeout=8000)
+            await page.wait_for_timeout(800)
 
             # Intercept the native OS file dialog that "upload a file" triggers
-            with page.expect_file_chooser(timeout=8000) as fc_info:
-                page.get_by_role("button", name="upload a file").click(timeout=6000)
-            fc_info.value.set_files(tmp_path)
+            async with page.expect_file_chooser(timeout=8000) as fc_info:
+                await page.get_by_role("button", name="upload a file").click(timeout=6000)
+            chooser = await fc_info.value
+            await chooser.set_files(tmp_path)
 
             # Wait for results page
-            page.wait_for_url("**search**", timeout=25000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_url("**search**", timeout=25000)
+            await page.wait_for_load_state("networkidle", timeout=15000)
 
             # Collect all external result links
-            for a in page.locator("a[href]").all()[:120]:
+            for a in (await page.locator("a[href]").all())[:120]:
                 try:
-                    href = a.get_attribute("href") or ""
+                    href = await a.get_attribute("href") or ""
                     if (
                         href.startswith("http")
                         and "google.com" not in href
@@ -639,11 +648,11 @@ def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
                         seen.add(href)
                         title, thumb = "", None
                         try:
-                            title = a.inner_text(timeout=400).strip()[:120]
+                            title = (await a.inner_text(timeout=400)).strip()[:120]
                         except Exception:
                             pass
                         try:
-                            src = a.locator("img").first.get_attribute("src", timeout=400)
+                            src = await a.locator("img").first.get_attribute("src", timeout=400)
                             if src and src.startswith("http"):
                                 thumb = src
                         except Exception:
@@ -668,8 +677,8 @@ def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
             ]:
                 try:
                     el = page.locator(sel).first
-                    if el.is_visible(timeout=800):
-                        nm = el.inner_text(timeout=400).strip()
+                    if await el.is_visible(timeout=800):
+                        nm = (await el.inner_text(timeout=400)).strip()
                         if (nm and 2 <= len(nm.split()) <= 5
                                 and nm not in names
                                 and nm.lower() not in _SKIP):
@@ -679,10 +688,8 @@ def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
                 except Exception:
                     continue
 
-            browser.close()
+            await browser.close()
 
-    except Exception as e:
-        logger.warning(f"Playwright Google Lens: {e}")
     finally:
         if tmp_path:
             try:
@@ -698,29 +705,36 @@ def _playwright_google_lens(img_bytes: bytes) -> tuple[list[dict], list[str]]:
 #  ENGINE 7 — Playwright Bing Visual Search (free, complements Google Lens)
 # ══════════════════════════════════════════════════════════════════════════
 def _playwright_bing_visual(img_bytes: bytes) -> tuple[list[dict], list[str]]:
-    """
-    Bing Visual Search via headless Chromium. No API key needed.
+    """Bing Visual Search via headless Chromium. No API key needed.
     Different index from Google — useful for Eastern Europe / Central Asia / India.
-    """
+    Async API run via asyncio.run() in this thread's own loop (see Lens)."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import async_playwright  # noqa: F401
     except ImportError:
         return [], []
+    try:
+        return asyncio.run(_bing_async(img_bytes))
+    except Exception as e:
+        logger.warning(f"Playwright Bing Visual: {e}")
+        return [], []
+
+
+async def _bing_async(img_bytes: bytes) -> tuple[list[dict], list[str]]:
+    from playwright.async_api import async_playwright
 
     matches, names, seen = [], [], set()
     tmp_path = None
-    asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             f.write(img_bytes)
             tmp_path = f.name
 
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            ctx = browser.new_context(
+            ctx = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -729,30 +743,31 @@ def _playwright_bing_visual(img_bytes: bytes) -> tuple[list[dict], list[str]]:
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
             )
-            page = ctx.new_page()
+            page = await ctx.new_page()
             page.set_default_timeout(15000)
 
             # Bing Images → camera icon → upload panel → file chooser
-            page.goto("https://www.bing.com/images", timeout=15000, wait_until="domcontentloaded")
-            page.get_by_role("button", name="Search using an image").click(timeout=6000)
-            page.wait_for_timeout(600)
+            await page.goto("https://www.bing.com/images", timeout=15000, wait_until="domcontentloaded")
+            await page.get_by_role("button", name="Search using an image").click(timeout=6000)
+            await page.wait_for_timeout(600)
 
             # Intercept native file dialog from "upload an image" button
-            with page.expect_file_chooser(timeout=8000) as fc_info:
-                page.get_by_role("button", name="upload an image").click(timeout=6000)
-            fc_info.value.set_files(tmp_path)
+            async with page.expect_file_chooser(timeout=8000) as fc_info:
+                await page.get_by_role("button", name="upload an image").click(timeout=6000)
+            chooser = await fc_info.value
+            await chooser.set_files(tmp_path)
 
-            page.wait_for_load_state("networkidle", timeout=20000)
+            await page.wait_for_load_state("networkidle", timeout=20000)
 
             # Bing result cards — each <a m='{"purl":"...","murl":"..."}'>
-            for a in page.locator("a[m]").all()[:80]:
+            for a in (await page.locator("a[m]").all())[:80]:
                 try:
-                    m_attr = a.get_attribute("m") or "{}"
+                    m_attr = await a.get_attribute("m") or "{}"
                     m_data = json.loads(m_attr)
                     actual_url = m_data.get("purl") or m_data.get("murl") or ""
                     if actual_url and "bing.com" not in actual_url and actual_url not in seen:
                         seen.add(actual_url)
-                        title = (a.get_attribute("title") or "").strip()[:120]
+                        title = (await a.get_attribute("title") or "").strip()[:120]
                         thumb = m_data.get("turl") or None
                         matches.append({
                             "url":       actual_url,
@@ -766,12 +781,12 @@ def _playwright_bing_visual(img_bytes: bytes) -> tuple[list[dict], list[str]]:
 
             # Fallback: collect plain href links if m-attribute cards are absent
             if not matches:
-                for a in page.locator("a[href]").all()[:80]:
+                for a in (await page.locator("a[href]").all())[:80]:
                     try:
-                        href = a.get_attribute("href") or ""
+                        href = await a.get_attribute("href") or ""
                         if href.startswith("http") and "bing.com" not in href and href not in seen:
                             seen.add(href)
-                            title = (a.get_attribute("title") or a.inner_text(timeout=300) or "").strip()[:120]
+                            title = (await a.get_attribute("title") or await a.inner_text(timeout=300) or "").strip()[:120]
                             matches.append({
                                 "url": href, "title": title,
                                 "platform": _platform(href), "source": "playwright_bing_visual",
@@ -783,8 +798,8 @@ def _playwright_bing_visual(img_bytes: bytes) -> tuple[list[dict], list[str]]:
             for sel in [".b_entityTitle", ".va_title h1", "[class*='entity'] h1"]:
                 try:
                     el = page.locator(sel).first
-                    if el.is_visible(timeout=800):
-                        nm = el.inner_text(timeout=400).strip()
+                    if await el.is_visible(timeout=800):
+                        nm = (await el.inner_text(timeout=400)).strip()
                         if nm and 2 <= len(nm.split()) <= 5 and nm not in names:
                             names.append(nm)
                             logger.info(f"Playwright Bing entity: '{nm}'")
@@ -792,10 +807,8 @@ def _playwright_bing_visual(img_bytes: bytes) -> tuple[list[dict], list[str]]:
                 except Exception:
                     continue
 
-            browser.close()
+            await browser.close()
 
-    except Exception as e:
-        logger.warning(f"Playwright Bing Visual: {e}")
     finally:
         if tmp_path:
             try:

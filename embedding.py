@@ -192,3 +192,51 @@ def _crop_face(frame: np.ndarray, fa: dict, padding: float = 0.20) -> np.ndarray
     if crop.size == 0:
         return cv2.resize(frame, (160, 160))
     return cv2.resize(crop, (160, 160))
+
+
+def hires_face_crop(
+    frame: np.ndarray,
+    bbox,
+    padding:  float = 0.4,
+    max_side: int   = 1024,
+    min_side: int   = 400,
+) -> np.ndarray:
+    """High-resolution face crop for REVERSE-IMAGE SEARCH (Lens / Bing / SerpApi).
+
+    Unlike `_crop_face` (which downsizes to the 160x160 Facenet input), this
+    keeps native resolution so the reverse engines have real detail to match on.
+    A 160px thumbnail returns garbage; this returns the face at full quality.
+
+    - Generous padding keeps hair/jaw/shoulders (helps Lens recall).
+    - Long side capped at `max_side` so uploads stay fast.
+    - Never upscales — only downsizes when above the cap.
+    - If there is no usable bbox, or the padded crop is smaller than `min_side`,
+      the full frame is returned (more pixels/context than a tiny crop).
+
+    bbox: (x, y, w, h) in frame coordinates, as returned by extract().
+    """
+    try:
+        H, W = frame.shape[:2]
+        x, y, w, h = (int(v) for v in (bbox or (0, 0, 0, 0)))
+        crop = None
+        if w > 0 and h > 0:
+            px, py = int(w * padding), int(h * padding)
+            x1, y1 = max(0, x - px), max(0, y - py)
+            x2, y2 = min(W, x + w + px), min(H, y + h + py)
+            c = frame[y1:y2, x1:x2]
+            if c.size and max(c.shape[:2]) >= min_side:
+                crop = c
+        if crop is None:
+            crop = frame                       # no face / crop too small → full frame
+        long_side = max(crop.shape[:2])
+        if long_side > max_side:               # downscale only, never upscale
+            s = max_side / long_side
+            crop = cv2.resize(
+                crop,
+                (max(1, int(crop.shape[1] * s)), max(1, int(crop.shape[0] * s))),
+                interpolation=cv2.INTER_AREA,
+            )
+        return crop
+    except Exception as e:
+        logger.debug(f"hires_face_crop failed: {e}")
+        return frame
