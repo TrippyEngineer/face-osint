@@ -67,11 +67,13 @@ writer = FolderWriter()
 
 _sse:    dict = {}   # sid → queue.Queue
 _cancel: dict = {}   # sid → threading.Event
+_cleanup_scheduled: set = set()   # sids with an SSE-removal timer already queued (guarded by _sse_lock)
 _sse_lock = threading.Lock()
 
 # ── ISSUE 1 FIX: per-image deduplication — prevents SSE reconnect spawning N searches ──
 _active_searches: dict = {}   # img_hash → sid
 _sid_to_hash:     dict = {}   # sid → img_hash (for cleanup)
+_active_ts:       dict = {}   # img_hash → creation time (TTL sweep guard)
 _active_lock = threading.Lock()
 
 # ── WiFi camera — single shared FrameReader (one phone at a time) ────────────
@@ -278,6 +280,7 @@ def run_search(sid: str, frame: np.ndarray, name: str,
         all_results = {}
         _t0         = time.time()
         _fut_dl: dict = {}   # future → its individual deadline
+        _timed_out: dict = {}   # label → future that blew its deadline (harvested later)
         _partial_emitted = False
 
         def _emit_partial():
@@ -289,7 +292,7 @@ def run_search(sid: str, frame: np.ndarray, name: str,
             flat = [m for s, d in all_results.items() if isinstance(d, dict)
                     for m in d.get("matches", [])]
             if not flat:
-                return
+                return False        # nothing to show yet — let the gate retry next loop
             try:
                 # Lower floor than the final MIN_SCORE_KEEP (0.25): face scores
                 # aren't in yet and the scorer weights face at 0.70, so text-only
@@ -306,8 +309,10 @@ def run_search(sid: str, frame: np.ndarray, name: str,
                      total=sum(len(v.get("matches", [])) for v in all_results.values()
                                if isinstance(v, dict)))
                 log("INFO", "partial", f"Preliminary results: {len(sm)} scored matches")
+                return True
             except Exception as e:
                 log("WARN", "partial", f"Partial scoring failed: {e}")
+                return False
 
         # PERF FIX (lag): do NOT use `with` here. Its implicit shutdown(wait=True)
         # blocks run_search until EVERY scraper thread finishes — including ones
@@ -342,6 +347,7 @@ def run_search(sid: str, frame: np.ndarray, name: str,
                         lbl = futs[f]; f.cancel()
                         elapsed = int(now - _t0)
                         all_results[lbl] = {"matches": [], "error": "Timed out"}
+                        _timed_out[lbl] = f   # may finish shortly after — harvest before scoring
                         log("WARN", lbl, f"Timed out after {elapsed}s")
                         push(step="scraping", scraper=lbl, count=0,
                              msg=f"{lbl} timed out", err="Timed out")
@@ -389,8 +395,10 @@ def run_search(sid: str, frame: np.ndarray, name: str,
                 # the full ~70s for reverse_face.
                 if (not _partial_emitted and pending
                         and pending.issubset(slow_futs)):
-                    _emit_partial()
-                    _partial_emitted = True
+                    # Only latch once we actually emitted — otherwise an early no-op
+                    # (empty data) would permanently disable the preliminary push.
+                    if _emit_partial():
+                        _partial_emitted = True
         finally:
             # Abandon still-running scrapers instead of joining them — they
             # already missed their deadline, so waiting only adds dead time.
@@ -456,6 +464,24 @@ def run_search(sid: str, frame: np.ndarray, name: str,
                 push(step="scraping", msg=f"LinkedIn from face search: {added}",
                      scraper="search_engines", count=len(se["matches"]))
 
+        # RECOVERY: a scraper that blew its deadline by a few seconds may have
+        # finished by now with real matches still sitting in its abandoned future
+        # (f.cancel() can't stop a started thread). Harvest those instead of
+        # scoring the empty "Timed out" placeholder — most impactful for
+        # reverse_face, the dominant 70%-weighted face signal.
+        for _lbl, _f in list(_timed_out.items()):
+            if _f.done() and not _f.cancelled():
+                try:
+                    _late = _f.result()
+                except Exception:
+                    continue
+                if _late and _late.get("matches"):
+                    all_results[_lbl] = _late
+                    _n = len(_late["matches"])
+                    log("INFO", _lbl, f"Recovered {_n} late matches after timeout")
+                    push(step="scraping", scraper=_lbl, count=_n,
+                         msg=f"{_lbl} recovered {_n} late hits")
+
         push(step="scraping", msg="All sources done", done_step=True)
         if cancelled(): return
 
@@ -515,14 +541,29 @@ def run_search(sid: str, frame: np.ndarray, name: str,
         if cancelled(): return
 
         # ── Step 8: Write report ──────────────────────────────────────
+        # Each persistence step is guarded independently: a late-stage failure
+        # (disk full, /mnt/d WAL I/O error, one bad match dict) must NOT skip the
+        # terminal 'done' event nor leave the search row stuck 'processing' with
+        # no verdict. We still emit 'done' below from the in-memory identity.
         push(step="writing", msg="Writing report…")
-        writer.write_results(folder=folder, name=name, search_id=sid,
-                             all_results=all_results, identity=identity)
-        db.complete_search(sid,
-                           verdict=identity.get("verdict", "unknown"),
-                           combined_score=identity.get("combined_score", 0.0))
+        try:
+            writer.write_results(folder=folder, name=name, search_id=sid,
+                                 all_results=all_results, identity=identity)
+        except Exception as e:
+            logger.exception(f"Search {sid[:8]} report write failed: {e}")
+            log("WARN", "storage", f"Report write failed: {e}")
+        try:
+            db.complete_search(sid,
+                               verdict=identity.get("verdict", "unknown"),
+                               combined_score=identity.get("combined_score", 0.0))
+        except Exception as e:
+            logger.exception(f"Search {sid[:8]} complete_search failed: {e}")
+            log("WARN", "storage", f"DB complete_search failed: {e}")
         for m in scored_m[:50]:
-            db.insert_match(sid, m.get("source", "?"), m)
+            try:
+                db.insert_match(sid, m.get("source", "?"), m)
+            except Exception as e:
+                log("WARN", "storage", f"insert_match skipped ({m.get('source','?')}): {e}")
 
         stored_files = [
             {"path": str(p), "name": p.name,
@@ -567,18 +608,29 @@ def run_search(sid: str, frame: np.ndarray, name: str,
 
 
 def _cleanup_session(sid: str):
-    """ISSUE 2: Remove SSE queue immediately once search is done/cancelled."""
-    # Small delay so the final 'done' event can be read by the browser
+    """Release a finished/cancelled search's resources. Idempotent: cancelled()
+    and run_search's finally both call it, so it must tolerate repeat calls."""
+    # Release the cancel + dedup locks SYNCHRONOUSLY — a re-search of the same
+    # image must never be wedged by a missed/delayed cleanup thread. (.pop is
+    # idempotent, so the inevitable second call is a harmless no-op.)
+    _cancel.pop(sid, None)
+    with _active_lock:
+        img_hash = _sid_to_hash.pop(sid, None)
+        if img_hash:
+            _active_searches.pop(img_hash, None)
+            _active_ts.pop(img_hash, None)
+    # Delay ONLY the SSE-queue removal so the browser can still read the final
+    # 'done' event — and spawn at most one such timer per sid.
+    with _sse_lock:
+        if sid in _cleanup_scheduled:
+            return
+        _cleanup_scheduled.add(sid)
+
     def _do():
         time.sleep(3)
         with _sse_lock:
             _sse.pop(sid, None)
-        _cancel.pop(sid, None)
-        # ISSUE 1 FIX: also release the image hash lock so retries are allowed later
-        with _active_lock:
-            img_hash = _sid_to_hash.pop(sid, None)
-            if img_hash:
-                _active_searches.pop(img_hash, None)
+            _cleanup_scheduled.discard(sid)
         logger.debug(f"Session {sid[:8]} cleaned up")
     threading.Thread(target=_do, daemon=True).start()
 
@@ -648,7 +700,16 @@ def api_search():
     # ISSUE 1 FIX: deduplicate by image hash — SSE reconnects & double-clicks
     # spawn the same base64 payload → return existing search_id instead of forking
     img_hash = hashlib.md5(raw).hexdigest()
+    _now = time.time()
+    _ttl = getattr(config, "SEARCH_DEDUP_TTL_S", 300)
     with _active_lock:
+        # TTL sweep: drop dedup entries whose cleanup never ran (e.g. a cleanup
+        # thread that failed to start) so a stale hash can't wedge re-search forever.
+        for _h in [h for h, ts in _active_ts.items() if _now - ts > _ttl]:
+            _active_ts.pop(_h, None)
+            _stale_sid = _active_searches.pop(_h, None)
+            if _stale_sid:
+                _sid_to_hash.pop(_stale_sid, None)
         if img_hash in _active_searches:
             existing_sid = _active_searches[img_hash]
             logger.info(f"Duplicate search for hash {img_hash[:8]} — reusing {existing_sid[:8]}")
@@ -657,6 +718,7 @@ def api_search():
         sid = str(uuid.uuid4())
         _active_searches[img_hash] = sid
         _sid_to_hash[sid] = img_hash
+        _active_ts[img_hash] = _now
 
     with _sse_lock:
         _sse[sid] = queue.Queue()
@@ -2020,6 +2082,7 @@ body{
 .cic-alert-item.warning{border-color:var(--yellow);background:var(--yellow-dim)}
 .cic-alert-item.high{border-color:#f97316;background:rgba(249,115,22,.1)}
 .cic-alert-item.critical{border-color:var(--red);background:var(--red-dim)}
+.cic-alert-item.resolved{border-color:#22c55e;background:rgba(34,197,94,.10);opacity:.85}
 .cic-alert-zone{font-weight:700;color:var(--text-primary);white-space:nowrap}
 .cic-alert-msg{color:var(--text-secondary);flex:1}
 .cic-alert-ts{font-size:9px;color:var(--text-muted);white-space:nowrap}

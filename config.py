@@ -85,6 +85,7 @@ SCRAPER_TIMEOUT_S   = 20     # max seconds per scraper before it is abandoned
 # two heavy ones (reverse_face, username) each spawn a browser, so peak is ~3
 # headless chromium — fine on any machine that already runs the DeepFace/YOLO stack.
 SCRAPER_MAX_WORKERS = 7      # one worker per scraper — no queueing, deadlines accurate
+SEARCH_DEDUP_TTL_S  = 300    # max age of an image-hash dedup entry before a TTL sweep drops it
 HTTP_TIMEOUT_S      = 12     # per HTTP request timeout
 HTTP_RETRIES        = 2      # retry transient failures this many times
 
@@ -191,6 +192,7 @@ CIC_WEBHOOK_MIN_SEVERITY = os.getenv("CIC_WEBHOOK_MIN_SEVERITY", "high")  # warn
 CIC_WEBHOOK_HEADERS      = os.getenv("CIC_WEBHOOK_HEADERS", "")           # optional JSON string
 CIC_WEBHOOK_TIMEOUT_S    = int(os.getenv("CIC_WEBHOOK_TIMEOUT_S", "6"))
 CIC_DISCORD_WEBHOOK_URL  = os.getenv("CIC_DISCORD_WEBHOOK_URL", "")       # Discord channel webhook
+CIC_NOTIFY_WORKERS       = int(os.getenv("CIC_NOTIFY_WORKERS", "3"))      # bounded notifier dispatch pool
 
 # ── CIC Phase 4: incident clips ─────────────────────────────────────────────
 CIC_CLIPS_ENABLED = os.getenv("CIC_CLIPS_ENABLED", "1") not in ("0", "false", "False")

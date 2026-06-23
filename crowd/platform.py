@@ -25,6 +25,7 @@ import queue
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -41,11 +42,16 @@ logger = logging.getLogger(__name__)
 _ZONES_PATH = Path(__file__).parent / "zones.json"
 ALERT_COOLDOWN_S = 60   # minimum seconds between same (zone, type) alerts
 HISTORY_LEN      = 300  # 5 min @ 1 Hz
+# Severity ordering used to tell a genuine escalation (rank increased this cycle)
+# from a sustained/de-escalated band, so a fresh critical is never swallowed by a
+# prior alert's cooldown.
+_RISK_RANK = {"safe": 0, "caution": 1, "high": 2, "critical": 3}
 
 
 class Platform:
     def __init__(self):
         self._lock        = threading.RLock()   # RLock: get_state() calls get_active_slots() which re-acquires
+        self._zones_error = ""                  # set loudly if zones.json is missing/corrupt
         self._zones_raw   = self._load_zones()
         self._analyzers   = {}          # slot_id → CameraAnalyzer
         self._zone_states = self._init_zone_states()
@@ -62,6 +68,14 @@ class Platform:
         self._notifiers = build_notifiers_from_config()
         if self._notifiers:
             logger.info(f"CIC notifiers active: {len(self._notifiers)}")
+            # Bounded pool (not an unbounded thread per alert) so a hung webhook +
+            # a flapping zone can't leak notifier threads without limit.
+            self._notify_pool = ThreadPoolExecutor(
+                max_workers=getattr(config, "CIC_NOTIFY_WORKERS", 3),
+                thread_name_prefix="CIC-notify",
+            )
+        else:
+            self._notify_pool = None
         self._subscribers: list = []
         self._running     = False
         self._thread: Optional[threading.Thread] = None
@@ -72,27 +86,47 @@ class Platform:
         try:
             return json.loads(_ZONES_PATH.read_text(encoding="utf-8"))
         except Exception as e:
-            logger.error(f"Failed to load zones.json: {e}")
+            # Fail LOUD: a missing/corrupt zones.json otherwise degrades the CIC
+            # into a silent no-op (thread runs, frames decode, but no zone state,
+            # alerts, or persistence). Surface it to operators via get_state() and
+            # rely on _synth_zone_state() so live counts/alerts still work.
+            self._zones_error = f"zones.json could not be loaded: {e}"
+            logger.critical(
+                f"CIC CONFIG ERROR — {self._zones_error}. Running with NO configured "
+                f"zones; slots will use synthesized default zones. Fix zones.json."
+            )
             return {"venue": {}, "zones": []}
 
+    def _make_zone_state(self, z: dict) -> dict:
+        return {
+            "id":       z["id"],
+            "name":     z.get("name", z["id"]),
+            "count":    0,
+            "density":  0.0,
+            "risk":     "safe",
+            "flow":     {"dx": 0.0, "dy": 0.0, "speed": 0.0},
+            "history":  deque([0] * HISTORY_LEN, maxlen=HISTORY_LEN),
+            "capacity": z.get("capacity", 10000),
+            "area_m2":  z.get("area_m2", 5000),
+            "slot":     z.get("camera_slot", -1),
+            "lat_lon":  z.get("lat_lon", []),
+            "color":    z.get("color", "#6366f1"),
+        }
+
     def _init_zone_states(self) -> dict:
-        states = {}
-        for z in self._zones_raw.get("zones", []):
-            states[z["id"]] = {
-                "id":       z["id"],
-                "name":     z["name"],
-                "count":    0,
-                "density":  0.0,
-                "risk":     "safe",
-                "flow":     {"dx": 0.0, "dy": 0.0, "speed": 0.0},
-                "history":  deque([0] * HISTORY_LEN, maxlen=HISTORY_LEN),
-                "capacity": z.get("capacity", 10000),
-                "area_m2":  z.get("area_m2", 5000),
-                "slot":     z.get("camera_slot", -1),
-                "lat_lon":  z.get("lat_lon", []),
-                "color":    z.get("color", "#6366f1"),
-            }
-        return states
+        return {z["id"]: self._make_zone_state(z)
+                for z in self._zones_raw.get("zones", [])}
+
+    def _synth_zone_state(self, zid: str, meta: dict) -> dict:
+        """Build a zone state on the fly for a slot whose zone id isn't in
+        zones.json (missing/partial config), so its meta is reported rather than
+        silently dropped."""
+        slot = meta.get("slot", -1)
+        cfg  = dict(self._zone_for_slot(slot))
+        cfg["id"] = zid
+        cfg.setdefault("name", zid)
+        cfg.setdefault("camera_slot", slot)
+        return self._make_zone_state(cfg)
 
     def get_zones_raw(self) -> dict:
         return self._zones_raw
@@ -171,6 +205,7 @@ class Platform:
                 "slots":        self.get_active_slots(),
                 "total_count":  sum(z.get("count", 0) for z in zones_snap.values()),
                 "venue":        self._zones_raw.get("venue", {}),
+                "config_error": self._zones_error,
             }
 
     def get_heatmap(self) -> list:
@@ -235,7 +270,11 @@ class Platform:
     # ── Background aggregation loop ───────────────────────────────────────
 
     def _ensure_running(self):
-        if not self._running:
+        # Restart a dead thread too — not just an un-started one. If _run ever
+        # exits unexpectedly, _running being stale-True must not wedge the
+        # aggregator off forever. Always called under self._lock (start_slot).
+        t = self._thread
+        if not self._running or t is None or not t.is_alive():
             self._running = True
             self._thread  = threading.Thread(
                 target=self._run, daemon=True, name="CIC-platform"
@@ -244,121 +283,187 @@ class Platform:
 
     def _run(self):
         logger.info("CIC platform aggregator started")
-        while True:
-            time.sleep(1.0)
+        try:
+            while True:
+                time.sleep(1.0)
 
-            with self._lock:
-                analyzers = dict(self._analyzers)
-                if not analyzers:
-                    self._running = False
-                    break
+                with self._lock:
+                    analyzers = dict(self._analyzers)
+                    if not analyzers:
+                        # Set under the lock, atomically with the emptiness check,
+                        # so a concurrent start_slot()/_ensure_running() can never
+                        # observe _running=True alongside a thread that's exiting.
+                        self._running = False
+                        break
 
-            updated = {}
-            for slot_id, analyzer in analyzers.items():
-                meta = analyzer.get_meta()
-                if not meta:
-                    continue
-                zone_id = meta.get("zone_id")
-                if not zone_id:
-                    continue
-                updated[zone_id] = meta
-
-            new_alerts = []
-            with self._lock:
-                for zid, meta in updated.items():
-                    if zid not in self._zone_states:
-                        continue
-                    zs = self._zone_states[zid]
-                    prev_risk = zs["risk"]
-                    zs["count"]        = meta["count"]
-                    zs["density"]      = meta["density"]
-                    zs["risk"]         = meta["risk"]
-                    zs["flow"]         = meta.get("flow", {})
-                    zs["n_suspicious"] = meta.get("n_suspicious", 0)
-                    zs["n_running"]    = meta.get("n_running", 0)
-                    zs["n_children"]   = meta.get("n_children", 0)
-                    zs["history"].append(meta["count"])
-
-                    # Alert on risk escalation
-                    risk = meta["risk"]
-                    alert = self._maybe_alert(zid, zs["name"], risk, prev_risk, meta)
-                    if alert:
-                        self._alerts.insert(0, alert)
-                        self._alerts = self._alerts[:100]
-                        new_alerts.append(alert)
-                        try:
-                            self._db.insert_cic_alert(alert)
-                        except Exception as e:
-                            logger.warning(f"persist alert failed: {e}")
-                        if self._notifiers:
-                            min_sev = getattr(config, "CIC_WEBHOOK_MIN_SEVERITY", "high")
-                            if should_notify(alert.get("severity", ""), min_sev):
-                                ctx = {"venue": self._zones_raw.get("venue", {}),
-                                       "zone": {"id": zid, "name": zs["name"]}}
-                                for n in self._notifiers:
-                                    threading.Thread(target=n.send, args=(alert, ctx),
-                                                     daemon=True, name="CIC-notify").start()
-                        if (getattr(config, "CIC_CLIPS_ENABLED", True)
-                                and alert.get("severity") in ("high", "critical")):
-                            a = self._analyzers.get(meta.get("slot"))
-                            if a is not None:
-                                _uid = alert.get("id")
-                                a.record_incident(
-                                    lambda p, u=_uid: self._db.update_cic_alert_clip(u, p))
-
-                    # Downsampled zone-reading persistence (+ on risk transition)
-                    now_ts = time.time()
-                    if should_persist_reading(
-                        now_ts, self._reading_last_ts.get(zid, 0.0),
-                        risk, prev_risk,
-                        getattr(config, "CIC_READING_PERSIST_S", 10),
-                    ):
-                        self._reading_last_ts[zid] = now_ts
-                        try:
-                            self._db.insert_cic_reading({
-                                "zone_id": zid, "zone_name": zs["name"],
-                                "count": meta["count"], "density": meta["density"],
-                                "risk": risk, "n_suspicious": meta.get("n_suspicious", 0),
-                            })
-                        except Exception as e:
-                            logger.warning(f"persist reading failed: {e}")
-
-            # Broadcast update
-            state_snap = self.get_state()
-            self._broadcast(
-                type="update",
-                zones={zid: {
-                    "count":       zs["count"],
-                    "density":     zs["density"],
-                    "risk":        zs["risk"],
-                    "trend":       list(zs["history"])[-30:],
-                    "n_suspicious": zs.get("n_suspicious", 0),
-                    "n_running":   zs.get("n_running", 0),
-                    "n_children":  zs.get("n_children", 0),
-                } for zid, zs in self._zone_states.items()},
-                total_count=state_snap["total_count"],
-                alerts=new_alerts,
-                ts=time.time(),
-            )
-
+                # Crash isolation: one bad cycle (a flaky analyzer, a transient DB
+                # error, a malformed meta) must NEVER kill the only aggregation
+                # thread — that would freeze every zone with no restart path.
+                try:
+                    self._tick(analyzers)
+                except Exception:
+                    logger.exception("CIC aggregator cycle failed; continuing")
+        finally:
+            # Backstop: re-arm even if the loop body itself ever escapes, so the
+            # next _ensure_running() can spin a fresh aggregator back up.
+            self._running = False
         logger.info("CIC platform aggregator stopped (no active slots)")
+
+    def _tick(self, analyzers: dict):
+        """One 1 Hz aggregation cycle: pull per-slot meta, update zone state,
+        raise/persist alerts, broadcast to subscribers. Raising here is caught by
+        _run() so a single bad cycle never takes the aggregator down."""
+        updated = {}
+        for slot_id, analyzer in analyzers.items():
+            meta = analyzer.get_meta()
+            if not meta:
+                continue
+            zone_id = meta.get("zone_id")
+            if not zone_id:
+                continue
+            updated[zone_id] = meta
+
+        new_alerts = []
+        with self._lock:
+            for zid, meta in updated.items():
+                if zid not in self._zone_states:
+                    # Config gap (missing/partial zones.json): synthesize a zone
+                    # state so the CIC still reports counts and raises alerts
+                    # instead of silently dropping this slot's data.
+                    self._zone_states[zid] = self._synth_zone_state(zid, meta)
+                    logger.warning(
+                        f"Zone '{zid}' not in zones.json — synthesized a default "
+                        f"zone state (check zones.json / camera_slot mapping)"
+                    )
+                zs = self._zone_states[zid]
+                prev_risk = zs["risk"]
+                zs["count"]        = meta["count"]
+                zs["density"]      = meta["density"]
+                zs["risk"]         = meta["risk"]
+                zs["flow"]         = meta.get("flow", {})
+                zs["n_suspicious"] = meta.get("n_suspicious", 0)
+                zs["n_running"]    = meta.get("n_running", 0)
+                zs["n_children"]   = meta.get("n_children", 0)
+                zs["history"].append(meta["count"])
+
+                # Alert on risk escalation
+                risk = meta["risk"]
+                alert = self._maybe_alert(zid, zs["name"], risk, prev_risk, meta)
+                if alert:
+                    self._alerts.insert(0, alert)
+                    self._alerts = self._alerts[:100]
+                    new_alerts.append(alert)
+                    try:
+                        self._db.insert_cic_alert(alert)
+                    except Exception as e:
+                        logger.warning(f"persist alert failed: {e}")
+                    if self._notifiers and self._notify_pool is not None:
+                        min_sev = getattr(config, "CIC_WEBHOOK_MIN_SEVERITY", "high")
+                        if should_notify(alert.get("severity", ""), min_sev):
+                            ctx = {"venue": self._zones_raw.get("venue", {}),
+                                   "zone": {"id": zid, "name": zs["name"]}}
+                            for n in self._notifiers:
+                                self._notify_pool.submit(self._safe_notify, n, alert, ctx)
+                    if (getattr(config, "CIC_CLIPS_ENABLED", True)
+                            and alert.get("severity") in ("high", "critical")):
+                        a = self._analyzers.get(meta.get("slot"))
+                        if a is not None:
+                            _uid = alert.get("id")
+                            a.record_incident(
+                                lambda p, u=_uid: self._db.update_cic_alert_clip(u, p))
+
+                # Recovery: a zone dropping out of an alerted (high/critical) band
+                # emits a one-off 'resolved' event so the alert feed/UI can clear
+                # the active state — escalations used to appear but never resolve.
+                elif (_RISK_RANK.get(prev_risk, 0) >= _RISK_RANK["high"]
+                        and _RISK_RANK.get(risk, 0) < _RISK_RANK["high"]):
+                    resolved = {
+                        "id":        str(uuid.uuid4())[:8],
+                        "timestamp": time.strftime("%H:%M:%S"),
+                        "zone_id":   zid, "zone": zs["name"],
+                        "type":      "density_resolved", "severity": "resolved",
+                        "message":   f"{zs['name']} recovered — now {risk.upper()} "
+                                     f"({meta['count']} persons).",
+                        "density":   meta["density"], "count": meta["count"],
+                        "acked":     False,
+                    }
+                    self._alerts.insert(0, resolved)
+                    self._alerts = self._alerts[:100]
+                    new_alerts.append(resolved)
+
+                # Downsampled zone-reading persistence (+ on risk transition)
+                now_ts = time.time()
+                if should_persist_reading(
+                    now_ts, self._reading_last_ts.get(zid, 0.0),
+                    risk, prev_risk,
+                    getattr(config, "CIC_READING_PERSIST_S", 10),
+                ):
+                    self._reading_last_ts[zid] = now_ts
+                    try:
+                        self._db.insert_cic_reading({
+                            "zone_id": zid, "zone_name": zs["name"],
+                            "count": meta["count"], "density": meta["density"],
+                            "risk": risk, "n_suspicious": meta.get("n_suspicious", 0),
+                        })
+                    except Exception as e:
+                        logger.warning(f"persist reading failed: {e}")
+
+        # Broadcast update
+        state_snap = self.get_state()
+        self._broadcast(
+            type="update",
+            zones={zid: {
+                "count":       zs["count"],
+                "density":     zs["density"],
+                "risk":        zs["risk"],
+                "trend":       list(zs["history"])[-30:],
+                "n_suspicious": zs.get("n_suspicious", 0),
+                "n_running":   zs.get("n_running", 0),
+                "n_children":  zs.get("n_children", 0),
+            } for zid, zs in self._zone_states.items()},
+            total_count=state_snap["total_count"],
+            alerts=new_alerts,
+            ts=time.time(),
+        )
+
+    def _safe_notify(self, notifier, alert, ctx):
+        """Run a notifier on the bounded pool; never let a throwing/hung notifier
+        surface as an unhandled exception in a pool thread."""
+        try:
+            notifier.send(alert, ctx)
+        except Exception as e:
+            logger.warning(f"notifier {getattr(notifier, 'name', notifier)} failed: {e}")
 
     def _maybe_alert(self, zone_id: str, zone_name: str,
                      risk: str, prev_risk: str, meta: dict) -> Optional[dict]:
         if risk == "safe":
+            # Zone cleared — re-arm its cooldown timestamps so a later
+            # re-escalation alerts immediately instead of being swallowed by a
+            # stale 60s window left over from the previous episode.
+            for k in [k for k in self._alert_ts if k[0] == zone_id]:
+                self._alert_ts.pop(k, None)
             return None
-        if risk == prev_risk:
-            # Only re-alert critical after cooldown
-            if risk != "critical":
-                return None
+
+        # A genuine escalation = the risk rank rose *this* cycle. Such a fresh
+        # event (especially into 'critical' / crush risk) must NEVER be throttled
+        # by a prior alert's cooldown — that was the bug: a zone that fired
+        # critical, cleared, then re-spiked within 60s had its new critical alert
+        # silently dropped. Only a *sustained* critical is rate-limited.
+        escalated = _RISK_RANK.get(risk, 0) > _RISK_RANK.get(prev_risk, 0)
 
         alert_type = f"density_{risk}"
         now        = time.time()
         key        = (zone_id, alert_type)
         last       = self._alert_ts.get(key, 0)
 
-        if now - last < ALERT_COOLDOWN_S:
-            return None
+        if not escalated:
+            # Sustained or de-escalated band: stay quiet for non-critical bands
+            # (already alerted on entry); re-alert a sustained critical only after
+            # the cooldown so a persistent crush is re-flagged without spamming.
+            if risk != "critical":
+                return None
+            if (now - last) < ALERT_COOLDOWN_S:
+                return None
 
         self._alert_ts[key] = now
 

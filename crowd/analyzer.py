@@ -53,6 +53,8 @@ class CameraAnalyzer:
         self._active  = False
         self._thread: Optional[threading.Thread] = None
         self._lock    = threading.Lock()
+        self._gen     = 0          # capture generation — bumped on every start/stop
+                                   # so a stale _run thread can detect it's superseded
 
         # Per-person tracking history: {track_id: {pos, stationary_count, velocity}}
         self._person_hist:     dict = {}
@@ -82,9 +84,16 @@ class CameraAnalyzer:
     # ── Public API ────────────────────────────────────────────────────────
 
     def start(self, source) -> bool:
+        # Signal any existing capture thread to stop and wait briefly for it, so a
+        # stale _run loop can't keep reading a capture we're about to replace.
+        old_thread = None
         with self._lock:
             if self._active:
-                self._stop_locked()
+                self._active = False
+                self._gen   += 1            # invalidate the running thread
+                old_thread   = self._thread
+        if old_thread is not None and old_thread.is_alive():
+            old_thread.join(timeout=2.0)    # best-effort: a dead-IP-cam read() may outlast this
 
         cap = cv2.VideoCapture(source if isinstance(source, int) else str(source))
         if not cap.isOpened():
@@ -92,16 +101,28 @@ class CameraAnalyzer:
             return False
 
         with self._lock:
+            self._gen   += 1
+            my_gen       = self._gen
             self._cap    = cap
             self._source = source
             self._active = True
+            # fresh per-run analysis state
+            self._last_frame  = None
+            self._last_meta   = {}
+            self._prev_gray   = None
+            self._person_hist = {}
+            self._frame_count = 0
 
         # Pre-warm YOLO in a separate daemon thread so frames flow immediately
         threading.Thread(target=self._load_model, daemon=True,
                          name=f"CIC-yolo{self.slot_id}").start()
 
+        # Each _run owns its capture (passed in) + generation and releases the
+        # capture itself on exit — stop()/replacement never release a capture out
+        # from under a thread that may be parked in cap.read().
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name=f"CIC-slot{self.slot_id}"
+            target=self._run, args=(cap, my_gen), daemon=True,
+            name=f"CIC-slot{self.slot_id}"
         )
         self._thread.start()
         logger.info(f"Slot {self.slot_id}: started — source={source}")
@@ -109,7 +130,10 @@ class CameraAnalyzer:
 
     def stop(self):
         with self._lock:
+            old_thread = self._thread
             self._stop_locked()
+        if old_thread is not None and old_thread.is_alive():
+            old_thread.join(timeout=2.0)    # best-effort; the thread releases its own capture on exit
         logger.info(f"Slot {self.slot_id}: stopped")
 
     def is_active(self) -> bool:
@@ -173,70 +197,76 @@ class CameraAnalyzer:
     # ── Background thread ─────────────────────────────────────────────────
 
     def _stop_locked(self):
+        # Do NOT release self._cap here: the owning _run thread releases its own
+        # capture on exit (in its finally). Releasing it from another thread while
+        # _run may be parked inside cap.read() is undefined behavior. Bumping the
+        # generation makes the running thread observe the stop and exit.
         self._active = False
-        if self._cap:
-            try:
-                self._cap.release()
-            except Exception:
-                pass
-            self._cap = None
+        self._gen   += 1
+        self._cap    = None          # drop our reference; the thread owns the object
         self._last_frame     = None
         self._last_meta      = {}
         self._prev_gray      = None
         self._person_hist    = {}
         self._frame_count    = 0
 
-    def _run(self):
+    def _run(self, cap, my_gen):
         interval = 1.0 / INFERENCE_FPS
         is_file  = isinstance(self._source, str) and not self._source.startswith("http")
 
-        while True:
-            with self._lock:
-                if not self._active:
-                    break
-                cap = self._cap
+        try:
+            while True:
+                with self._lock:
+                    if not self._active or self._gen != my_gen:
+                        break
 
-            t0  = time.time()
-            ret, frame = cap.read()
+                t0  = time.time()
+                ret, frame = cap.read()
 
-            if not ret or frame is None:
-                if is_file:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                else:
-                    time.sleep(0.1)
-                    continue
+                if not ret or frame is None:
+                    if is_file:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    else:
+                        time.sleep(0.1)
+                        continue
 
-            # Downscale for inference, preserving aspect ratio (no upscaling).
-            # Forcing 640×480 squished non-4:3 footage and threw away the
-            # resolution YOLO needs to spot small/distant people.
-            _h0, _w0 = frame.shape[:2]
-            _target  = getattr(config, "CIC_INFERENCE_SIZE", 960)
-            _scale   = _target / max(_h0, _w0)
-            if _scale < 1.0:
-                frame = cv2.resize(frame, (int(_w0 * _scale), int(_h0 * _scale)))
-            self._frame_count += 1
+                # Downscale for inference, preserving aspect ratio (no upscaling).
+                # Forcing 640×480 squished non-4:3 footage and threw away the
+                # resolution YOLO needs to spot small/distant people.
+                _h0, _w0 = frame.shape[:2]
+                _target  = getattr(config, "CIC_INFERENCE_SIZE", 960)
+                _scale   = _target / max(_h0, _w0)
+                if _scale < 1.0:
+                    frame = cv2.resize(frame, (int(_w0 * _scale), int(_h0 * _scale)))
+                self._frame_count += 1
 
-            # Buffer raw (pre-overlay) frames for incident clips
+                # Buffer raw (pre-overlay) frames for incident clips
+                try:
+                    self._clip_buf.append(frame.copy())
+                except Exception:
+                    pass
+
+                try:
+                    meta, annotated = self._analyze(frame)
+                except Exception as e:
+                    logger.debug(f"Slot {self.slot_id} analyze error: {e}")
+                    meta, annotated = {}, frame
+
+                with self._lock:
+                    if self._gen != my_gen:
+                        break                    # superseded mid-cycle; don't clobber new state
+                    self._last_meta  = meta
+                    self._last_frame = annotated
+
+                elapsed = time.time() - t0
+                time.sleep(max(0.0, interval - elapsed))
+        finally:
             try:
-                self._clip_buf.append(frame.copy())
+                cap.release()
             except Exception:
                 pass
-
-            try:
-                meta, annotated = self._analyze(frame)
-            except Exception as e:
-                logger.debug(f"Slot {self.slot_id} analyze error: {e}")
-                meta, annotated = {}, frame
-
-            with self._lock:
-                self._last_meta  = meta
-                self._last_frame = annotated
-
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, interval - elapsed))
-
-        logger.debug(f"Slot {self.slot_id}: thread exited")
+            logger.debug(f"Slot {self.slot_id}: thread exited (gen {my_gen})")
 
     # ── Core analysis ─────────────────────────────────────────────────────
 
