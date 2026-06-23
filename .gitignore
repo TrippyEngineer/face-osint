@@ -19,3 +19,8 @@ CLAUDE.md
 # IDE
 .vscode/
 .gstack/
+
+# CIC test video binaries (re-downloadable; see data/test_videos/README.md)
+data/test_videos/*.avi
+data/test_videos/*.mp4
+data/uploads/

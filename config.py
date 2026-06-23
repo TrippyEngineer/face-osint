@@ -172,7 +172,7 @@ CIC_MAX_DET           = 1000    # per-frame detection cap (was YOLO default 300)
 # Density = count / camera field-of-view area. Per-zone fov_area_m2 lives in
 # zones.json; this is the fallback when a zone omits it. NOTE: density must use
 # the camera's visible area, NOT the whole zone area, or risk never escalates.
-CIC_FOV_AREA_M2       = 100.0
+CIC_FOV_AREA_M2       = float(os.getenv("CIC_FOV_AREA_M2", "100.0"))
 
 # Behavioural heuristics (crude — tune per deployment). Stricter than the old
 # 25-frame / 12-px defaults to cut false positives in crowds.
@@ -185,11 +185,11 @@ CIC_FACE_MIN_CROP_PX   = 70     # skip Khoya-Paya capture for crops smaller than
 # Density bands (persons/m²): a density threshold alone is NOT stampede prediction
 # (the 2025 Sangam crush fired its alarm too late). Helbing pressure = density ×
 # velocity-variance + turbulence escalate the risk EARLIER. Calibrate per camera.
-CIC_PRESSURE_ENABLED       = True
-CIC_DENSE_DENSITY          = 2.0    # ppl/m² — comfortable-but-crowded
-CIC_COMPRESSION_DENSITY    = 5.0    # ppl/m² — body compression begins (risky)
-CIC_CRITICAL_DENSITY       = 8.0    # ppl/m² — crush regime (critical)
-CIC_TURBULENCE_CV          = 0.75   # velocity coeff-of-variation → stop-and-go/turbulence
+CIC_PRESSURE_ENABLED       = os.getenv("CIC_PRESSURE_ENABLED", "1") not in ("0", "false", "False")
+CIC_DENSE_DENSITY          = float(os.getenv("CIC_DENSE_DENSITY", "2.0"))         # ppl/m² — comfortable-but-crowded
+CIC_COMPRESSION_DENSITY    = float(os.getenv("CIC_COMPRESSION_DENSITY", "5.0"))   # ppl/m² — body compression begins (risky)
+CIC_CRITICAL_DENSITY       = float(os.getenv("CIC_CRITICAL_DENSITY", "8.0"))      # ppl/m² — crush regime (critical)
+CIC_TURBULENCE_CV          = float(os.getenv("CIC_TURBULENCE_CV", "0.75"))        # velocity coeff-of-variation → stop-and-go/turbulence
 
 
 # ── CIC Phase 4: persistence / retention ────────────────────────────────────
