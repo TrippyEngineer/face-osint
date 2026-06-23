@@ -212,8 +212,11 @@ def _edge_weight(a: dict, b: dict) -> float:
 
 
 def _clean_name(p: dict) -> str:
-    """Strip title suffixes like ' - Programme officer' / ' | LinkedIn'."""
-    nm = (p.get("name") or p.get("username") or "").strip()
+    """Resolve a display name, stripping title suffixes like ' - Programme
+    officer' / ' | LinkedIn'. reverse_face stores the person name ONLY in
+    `title`, so fall back to it (mirrors scorer.py) — otherwise the
+    name-consistency gate below is dead for every reverse-image face hit."""
+    nm = (p.get("name") or p.get("username") or p.get("title") or "").strip()
     for sep in (" - ", " | ", " – ", " — "):
         nm = nm.split(sep)[0]
     return nm.strip()
@@ -223,44 +226,87 @@ def _merge(query_name: str, profiles: list) -> dict:
     # Identity is FACE-anchored: only face-verified profiles define who this is.
     verified = [p for p in profiles
                 if p.get("face_verified") or (p.get("face_score") or 0) >= config.FACE_POSSIBLE]
-    # Among verified, prefer those whose name actually matches the query — drops
-    # face-similar connections / look-alikes (e.g. "Pujya Ghosh") from driving
-    # the identity's name + contact details.
+    # Among verified, prefer those whose name actually matches the query — this
+    # corroboration is what turns a bare reverse-image hit into a real identity.
     qn = (query_name or "").lower().strip()
     name_consistent = [p for p in verified
                        if qn and _ratio(qn, _clean_name(p).lower()) >= 0.6]
-    core = name_consistent or verified or profiles   # graceful fallback (name-only clusters)
 
-    best = max(core, key=lambda p: (p.get("face_score") or 0.0, p.get("combined_score", 0)))
+    has_face     = bool(verified)
+    corroborated = bool(name_consistent)   # face AND the typed name agree
 
-    urls    = list({p.get("url") or p.get("profile_url") or "" for p in profiles if p.get("url") or p.get("profile_url")})
+    # Where the identity's name / URLs / contact may be drawn from:
+    #   corroborated        → the face+name matches (a genuine identity)
+    #   face but no name     → NOTHING. A right-face / wrong-or-absent-name
+    #                          reverse-image hit is a LEAD, never an asserted
+    #                          identity — this was the "CONFIRMED PUJYA GHOSH" bug.
+    #   no face (name only)  → the name-matched profiles (name leads)
+    if corroborated:
+        core = name_consistent
+    elif has_face:
+        core = []
+    else:
+        core = profiles
+
+    ranking_pool = name_consistent or verified or profiles
+    best = max(ranking_pool, key=lambda p: (p.get("face_score") or 0.0, p.get("combined_score", 0)))
+
+    core_urls = list({p.get("url") or p.get("profile_url") or "" for p in core
+                      if p.get("url") or p.get("profile_url")})
     sources = list({p.get("source", "") for p in profiles if p.get("source")})
     faces   = ([p["face_score"] for p in verified if p.get("face_score") is not None]
                or [p["face_score"] for p in profiles if p.get("face_score") is not None])
 
-    # A face match alone (especially reverse-image look-alikes) is a *candidate*,
-    # not proof. Only call it CONFIRMED when the query NAME corroborates the face;
-    # for a photo-only search or a name mismatch, cap the verdict at POSSIBLE.
+    # A face match alone (especially reverse-image look-alikes) is a CANDIDATE,
+    # not proof. Only CONFIRMED when the query name corroborates the face; a
+    # photo-only search or a name mismatch caps the verdict at POSSIBLE.
     verdict = best.get("verdict", "possible")
-    if verdict == "confirmed" and not name_consistent:
+    if verdict == "confirmed" and not corroborated:
         verdict = "possible"
+
+    if corroborated:
+        resolved_name = _clean_name(best) or query_name
+        profile_urls  = core_urls
+    elif has_face:
+        # right face, wrong/absent name → don't name a stranger or attach their URL
+        resolved_name = query_name or "Unknown"
+        profile_urls  = []
+    else:
+        resolved_name = _clean_name(best) or query_name or "Unknown"
+        profile_urls  = core_urls
+
+    # Reverse-image leads: surface the uncorroborated face hits as "where this
+    # face appears", instead of asserting one of them as the identity.
+    face_leads = []
+    if has_face and not corroborated:
+        for p in sorted(verified, key=lambda x: -(x.get("face_score") or 0.0))[:20]:
+            face_leads.append({
+                "url":          p.get("url") or p.get("profile_url") or "",
+                "name_on_page": _clean_name(p),
+                "face_score":   round(p.get("face_score") or 0.0, 3),
+                "photo_url":    p.get("photo_url") or p.get("avatar_url") or "",
+                "source":       p.get("source", ""),
+            })
 
     return {
         "query_name":     query_name,
-        "resolved_name":  _clean_name(best) or query_name,
+        "resolved_name":  resolved_name,
+        "corroborated":   corroborated,
         "face_score":     max(faces) if faces else None,
-        "combined_score": max((p.get("combined_score", 0) for p in core), default=0.0),
+        "combined_score": max((p.get("combined_score", 0) for p in ranking_pool), default=0.0),
         "verdict":        verdict,
         "sources":        sources,
-        "profile_urls":   [u for u in urls if u],
-        # contact/identity fields come ONLY from the core (face-verified,
-        # query-consistent) profiles — never from same-name strangers.
+        "profile_urls":   [u for u in profile_urls if u],
+        # contact/identity fields come ONLY from `core` — empty for an
+        # uncorroborated face hit, so a stranger's details never leak in.
         "email":          _first(core, "email"),
         "company":        _first(core, "company") or _first(core, "affiliation"),
         "location":       _first(core, "location"),
         "username":       _first(core, "username"),
         "bio":            _first(core, "bio"),
         "photo_url":      _first(core, "photo_url") or _first(core, "avatar_url"),
+        # reverse-image "where this face appears" leads (uncorroborated hits)
+        "face_leads":     face_leads,
         "all_profiles":   profiles,
     }
 
@@ -268,9 +314,10 @@ def _merge(query_name: str, profiles: list) -> dict:
 def _empty(name: str) -> dict:
     return {
         "query_name": name, "resolved_name": name,
+        "corroborated": False,
         "face_score": None, "combined_score": 0.0,
         "verdict": "no_results", "sources": [],
-        "profile_urls": [], "all_profiles": [],
+        "profile_urls": [], "face_leads": [], "all_profiles": [],
     }
 
 

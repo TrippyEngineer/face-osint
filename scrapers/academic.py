@@ -16,8 +16,15 @@ _SS_CACHE_TTL = 3600   # seconds
 
 
 def scrape(context: dict) -> dict:
-    name    = context["name"]
+    name    = (context.get("name") or "").strip()
     matches = []
+
+    # Without a name these APIs return garbage: OpenAlex yields the globally
+    # largest authors for search='', Semantic Scholar 429s on query='', and
+    # _orcid would IndexError on an empty split. A photo-only search has no name
+    # signal, so there is nothing meaningful for academic sources to return.
+    if not name:
+        return {"source": "academic", "matches": []}
 
     for fn in (_google_scholar, _semantic_scholar, _open_alex, _orcid):
         try:
@@ -88,6 +95,8 @@ def _open_alex(name: str) -> list:
 
 def _orcid(name: str) -> list:
     parts = name.strip().split()
+    if not parts:                       # guard: empty name → no family-name token
+        return []
     q     = f'family-name:{parts[-1]}'
     if len(parts) > 1:
         q += f' given-names:{parts[0]}'

@@ -565,12 +565,18 @@ def run_search(sid: str, frame: np.ndarray, name: str,
             except Exception as e:
                 log("WARN", "storage", f"insert_match skipped ({m.get('source','?')}): {e}")
 
-        stored_files = [
-            {"path": str(p), "name": p.name,
-             "rel":  str(p.relative_to(folder)),
-             "size_kb": round(p.stat().st_size / 1024, 1)}
-            for p in sorted(folder.rglob("*")) if p.is_file()
-        ]
+        # Guard the folder walk: a late rglob/stat failure must not route past the
+        # terminal 'done' event into the outer 'error' handler (it's only a file list).
+        try:
+            stored_files = [
+                {"path": str(p), "name": p.name,
+                 "rel":  str(p.relative_to(folder)),
+                 "size_kb": round(p.stat().st_size / 1024, 1)}
+                for p in sorted(folder.rglob("*")) if p.is_file()
+            ]
+        except Exception as e:
+            log("WARN", "storage", f"Listing output files failed: {e}")
+            stored_files = []
         log("INFO", "storage", "Report written",
             {"folder": str(folder), "files": stored_files,
              "WARNING": "captured_photo.jpg has your camera frame. "
