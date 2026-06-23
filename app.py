@@ -1046,7 +1046,7 @@ def cic_infra():
 @app.route("/crowd/api/infra/<eid>", methods=["POST"])
 def cic_set_infra(eid):
     """Open/close/restrict a gate, bridge, or exit (operator control)."""
-    d  = request.get_json() or {}
+    d  = request.get_json(silent=True) or {}
     ok = get_platform().set_infra_state(eid, d.get("state", ""))
     if not ok:
         return jsonify(error="Unknown element or invalid state (open|restricted|closed)"), 400
@@ -2116,6 +2116,9 @@ body{
 .cic-sop-head{font-size:10px;font-weight:700;letter-spacing:.05em;color:var(--accent-hover);margin-bottom:3px}
 .cic-sop-conflict{color:var(--red);font-weight:600;font-size:11px;margin:2px 0}
 .cic-sop-actions{margin:2px 0 0 16px;padding:0;font-size:11px;color:var(--text-secondary);line-height:1.5}
+.cic-infra-chip{font-size:10px;font-weight:600;padding:3px 8px;border:1px solid var(--border);border-radius:5px;background:var(--bg-elevated);cursor:pointer}
+.cic-infra-chip:hover{filter:brightness(1.25)}
+.cic-infra-chip:disabled{opacity:.5;cursor:default}
 .cic-alert-ts{font-size:9px;color:var(--text-muted);white-space:nowrap}
 .cic-llm-panel{border-top:1px solid var(--border);padding:10px;display:flex;flex-direction:column;gap:6px;flex-shrink:0;background:var(--bg-card)}
 .cic-llm-title{font-size:11px;font-weight:700;color:var(--accent)}
@@ -2566,6 +2569,10 @@ body{
   <!-- Tab 3: Alerts + LLM SOP assistant -->
   <div class="cic-panel" id="cic-panel-alerts">
     <div class="cic-alerts-layout">
+      <div id="cic-infra-bar" style="flex:none;border-bottom:1px solid var(--border);padding:8px 10px">
+        <div style="font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--text-muted);margin-bottom:6px">INFRASTRUCTURE &mdash; gates &middot; bridges &middot; exits (click to toggle &mdash; a closed exit/bridge under a high/critical SOP raises a conflict)</div>
+        <div id="cic-infra-list" style="display:flex;flex-wrap:wrap;gap:6px"><span style="color:var(--text-muted);font-size:11px">Loading&hellip;</span></div>
+      </div>
       <div id="cic-clip-list" style="flex:none;max-height:130px;overflow-y:auto;border-bottom:1px solid var(--border);padding:8px">
         <div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>
       </div>
@@ -3865,6 +3872,7 @@ function _cicSyncSlots() {
       if (dot)  dot.className = 'cic-status-dot live';
     });
   }).catch(function() {});
+  _cicLoadInfra();
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────
@@ -3882,6 +3890,7 @@ function cicTab(name) {
   if (name === 'analytics' && !_cicBarChart) {
     setTimeout(_cicInitCharts, 50);
   }
+  if (name === 'alerts') _cicLoadInfra();
   if (name === 'alerts') { _cicLoadClips(); }
   if (name === 'assistant') { _asstInit(); }
 }
@@ -4403,10 +4412,10 @@ function _cicAddAlert(a) {
 
   var row =
     '<div style="display:flex;align-items:flex-start;gap:8px;width:100%">' +
-      '<span class="cic-alert-ts">' + (a.timestamp || '') + '</span>' +
-      '<span class="cic-alert-zone">' + (a.zone || '') + '</span>' +
-      '<span class="cic-alert-msg">' + (a.message || '') + '</span>' +
-      (a.id && !a.acked ? '<button class="cic-ack-btn" data-aid="' + a.id + '" onclick="_cicAckAlert(this)">ACK</button>' : '') +
+      '<span class="cic-alert-ts">' + esc(a.timestamp || '') + '</span>' +
+      '<span class="cic-alert-zone">' + esc(a.zone || '') + '</span>' +
+      '<span class="cic-alert-msg">' + esc(a.message || '') + '</span>' +
+      (a.id && !a.acked ? '<button class="cic-ack-btn" data-aid="' + esc(a.id) + '" onclick="_cicAckAlert(this)">ACK</button>' : '') +
     '</div>';
 
   var sopHtml = '';
@@ -4451,6 +4460,44 @@ function _cicAckAlert(btn) {
       else { btn.disabled = false; }
     })
     .catch(function() { btn.disabled = false; });
+}
+
+// ── Infrastructure (gate / bridge / exit) operator control ──────────────────
+var _CIC_INFRA_NEXT = {open: 'restricted', restricted: 'closed', closed: 'open'};
+function _cicInfraColor(s) {
+  return s === 'open' ? 'var(--green)' : s === 'restricted' ? 'var(--yellow)' : 'var(--red)';
+}
+function _cicRenderInfra(elements) {
+  var box = document.getElementById('cic-infra-list');
+  if (!box) return;
+  if (!elements || !elements.length) {
+    box.innerHTML = '<span style="color:var(--text-muted);font-size:11px">No infrastructure configured.</span>';
+    return;
+  }
+  box.innerHTML = elements.map(function(e) {
+    var col  = _cicInfraColor(e.state);
+    var icon = e.kind === 'bridge' ? '\u{1F309}' : e.kind === 'exit' ? '\u{1F6AA}' : '\u{1F6C2}';
+    return '<button class="cic-infra-chip" data-eid="' + esc(e.id) + '" data-state="' + esc(e.state) + '" ' +
+      'title="' + esc(e.kind) + ' — click: open → restricted → closed" onclick="_cicCycleInfra(this)" ' +
+      'style="border-color:' + col + ';color:' + col + '">' +
+      icon + ' ' + esc(e.name) + ' · ' + esc(String(e.state || '').toUpperCase()) + '</button>';
+  }).join('');
+}
+function _cicCycleInfra(btn) {
+  var eid  = btn.getAttribute('data-eid');
+  var next = _CIC_INFRA_NEXT[btn.getAttribute('data-state') || 'open'] || 'open';
+  btn.disabled = true;
+  fetch('/crowd/api/infra/' + encodeURIComponent(eid), {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({state: next})
+  }).then(function(r) { return r.json(); })
+    .then(function(j) { if (j.ok) _cicLoadInfra(); else btn.disabled = false; })
+    .catch(function() { btn.disabled = false; });
+}
+function _cicLoadInfra() {
+  fetch('/crowd/api/infra').then(function(r) { return r.json(); })
+    .then(function(d) { _cicRenderInfra(d.elements || []); })
+    .catch(function() {});
 }
 
 // ── Leaflet GIS Map ────────────────────────────────────────────────────────

@@ -352,8 +352,21 @@ class CameraAnalyzer:
             except Exception as e:
                 logger.debug(f"Slot {self.slot_id} tiling error: {e}")
 
-        # Zone density + risk
-        count    = len(tiled_centers) if tiled_centers is not None else len(detections)
+        # Zone density + risk. Tiling (if on) already produces a dense count;
+        # otherwise the counting head can occlusion-correct the raw detector count.
+        if tiled_centers is not None:
+            count = len(tiled_centers)
+            count_method = "tiling"
+        else:
+            from crowd import counting
+            _ce = counting.estimate(
+                [d["xyxy"] for d in detections if d.get("xyxy")], w, h,
+                backend=getattr(config, "CIC_COUNTING", "detector"),
+                occlusion_gain=getattr(config, "CIC_OCCLUSION_GAIN", 1.5),
+                max_factor=getattr(config, "CIC_OCCLUSION_MAX_FACTOR", 2.5),
+            )
+            count        = _ce["count"]
+            count_method = _ce["method"]
         # Density must use the camera's visible area, not the whole zone area,
         # otherwise count/area is microscopic and risk never escalates.
         fov_area = self.zone_cfg.get("fov_area_m2") or getattr(config, "CIC_FOV_AREA_M2", 100.0)
@@ -388,6 +401,7 @@ class CameraAnalyzer:
             "zone_id":       self.zone_cfg.get("id", f"zone_{self.slot_id}"),
             "zone_name":     self.zone_cfg.get("name", f"Zone {self.slot_id}"),
             "count":         count,
+            "count_method":  count_method,
             "density":       round(density, 4),
             "risk":          risk,
             "flow":          flow_data,

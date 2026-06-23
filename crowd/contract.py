@@ -38,9 +38,10 @@ class Meta(TypedDict, total=False):
     slot:        int
     zone_id:     str
     zone_name:   str
-    count:       int
-    density:     float          # persons / m² of the camera FOV
-    risk:        str            # one of RISK_LEVELS
+    count:        int
+    count_method: str           # detector | occlusion | tiling (crowd/counting.py)
+    density:      float          # persons / m² of the camera FOV
+    risk:         str            # one of RISK_LEVELS
     # ── motion / context ──
     flow:        Flow
     timestamp:   float

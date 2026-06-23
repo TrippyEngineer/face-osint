@@ -191,6 +191,14 @@ CIC_COMPRESSION_DENSITY    = float(os.getenv("CIC_COMPRESSION_DENSITY", "5.0")) 
 CIC_CRITICAL_DENSITY       = float(os.getenv("CIC_CRITICAL_DENSITY", "8.0"))      # ppl/m² — crush regime (critical)
 CIC_TURBULENCE_CV          = float(os.getenv("CIC_TURBULENCE_CV", "0.75"))        # velocity coeff-of-variation → stop-and-go/turbulence
 
+# ── Crowd-counting head (crowd/counting.py) ─────────────────────────────────
+# Detectors undercount dense crowds (heads occlude). "occlusion" applies a CPU
+# coverage-based correction; "detector" (default) = raw YOLO count. Alternative
+# to CIC_TILING — use one dense-count strategy.
+CIC_COUNTING               = os.getenv("CIC_COUNTING", "detector")               # detector | occlusion
+CIC_OCCLUSION_GAIN         = float(os.getenv("CIC_OCCLUSION_GAIN", "1.5"))        # inflate per unit box-coverage
+CIC_OCCLUSION_MAX_FACTOR   = float(os.getenv("CIC_OCCLUSION_MAX_FACTOR", "2.5"))  # cap the correction
+
 # ── SOP playbook engine (crowd/sop.py) ──────────────────────────────────────
 CIC_SOP_ESCALATE_S         = int(os.getenv("CIC_SOP_ESCALATE_S", "120"))  # unacked high/critical SOP escalates after this
 
