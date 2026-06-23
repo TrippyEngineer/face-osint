@@ -36,6 +36,7 @@ import config
 from storage.database import Database
 from crowd.persistence import should_persist_reading
 from crowd.notifier import build_notifiers_from_config, should_notify
+from crowd import sop
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,11 @@ class Platform:
         self._zone_states = self._init_zone_states()
         self._alerts      = []          # list of alert dicts, newest first
         self._alert_ts    = {}          # (zone_id, alert_type) → last_alert_time
+        # SOP playbook engine: prescribes actions per alert, models gate/bridge
+        # state, and escalates unacknowledged high/critical SOPs.
+        self._infra       = sop.Infrastructure.from_config(self._zones_raw)
+        self._sop         = sop.SopTracker(
+            escalate_after_s=getattr(config, "CIC_SOP_ESCALATE_S", 120))
         self._db          = Database()
         self._reading_last_ts: dict = {}   # zone_id → last persisted reading time
         try:
@@ -210,7 +216,28 @@ class Platform:
                 "total_count":  sum(z.get("count", 0) for z in zones_snap.values()),
                 "venue":        self._zones_raw.get("venue", {}),
                 "config_error": self._zones_error,
+                "infrastructure": self._infra.snapshot(),
             }
+
+    # ── SOP acknowledgement + infrastructure control ──────────────────────
+    def acknowledge_alert(self, alert_id: str) -> bool:
+        with self._lock:
+            self._sop.acknowledge(alert_id)
+            for a in self._alerts:
+                if a.get("id") == alert_id:
+                    a["acked"] = True
+                    return True
+        return False
+
+    def set_infra_state(self, element_id: str, state: str) -> bool:
+        """Operator opens/closes a gate/bridge/exit. A closed egress will be
+        flagged as a conflict on the next high/critical SOP for its zone."""
+        with self._lock:
+            return self._infra.set_state(element_id, state)
+
+    def get_infrastructure(self) -> list:
+        with self._lock:
+            return self._infra.snapshot()
 
     def get_heatmap(self) -> list:
         """Return [lat, lng, intensity] points for Leaflet.heat from active slots."""
@@ -361,6 +388,10 @@ class Platform:
                     self._alerts.insert(0, alert)
                     self._alerts = self._alerts[:100]
                     new_alerts.append(alert)
+                    # Register the SOP activation for ack/escalation tracking.
+                    if alert.get("sop"):
+                        self._sop.activate(alert["id"], zid, alert["sop"]["sop_id"],
+                                           alert.get("severity", "warning"), time.time())
                     try:
                         self._db.insert_cic_alert(alert)
                     except Exception as e:
@@ -398,6 +429,7 @@ class Platform:
                     self._alerts.insert(0, resolved)
                     self._alerts = self._alerts[:100]
                     new_alerts.append(resolved)
+                    self._sop.clear_zone(zid)   # recovered → drop its SOP activations
 
                 # Downsampled zone-reading persistence (+ on risk transition)
                 now_ts = time.time()
@@ -415,6 +447,29 @@ class Platform:
                         })
                     except Exception as e:
                         logger.warning(f"persist reading failed: {e}")
+
+            # SOP escalation: an unacknowledged high/critical SOP past its timer
+            # escalates up the chain of command as a fresh critical alert.
+            for esc in self._sop.due_for_escalation(time.time()):
+                zs2 = self._zone_states.get(esc.zone_id, {})
+                ealert = {
+                    "id":        str(uuid.uuid4())[:8],
+                    "timestamp": time.strftime("%H:%M:%S"),
+                    "zone_id":   esc.zone_id,
+                    "zone":      zs2.get("name", esc.zone_id),
+                    "type":      "sop_escalation",
+                    "severity":  "critical",
+                    "message":   (f"ESCALATION — {esc.sop_id} unacknowledged for "
+                                  f"{int(self._sop.escalate_after_s)}s. Notify higher command."),
+                    "acked":     False,
+                }
+                self._alerts.insert(0, ealert)
+                self._alerts = self._alerts[:100]
+                new_alerts.append(ealert)
+                try:
+                    self._db.insert_cic_alert(ealert)
+                except Exception as e:
+                    logger.warning(f"persist escalation failed: {e}")
 
         # Broadcast update
         state_snap = self.get_state()
@@ -486,6 +541,11 @@ class Platform:
         }
         severity_map = {"caution": "warning", "high": "high", "critical": "critical"}
 
+        # Prescribe SOP actions (replaces the hard-coded "ACTIVATE SOP-3" string):
+        # concrete steps + gate/bridge targets + closed-egress conflicts.
+        prescription = sop.prescribe(zone_id, zone_name, risk,
+                                     meta.get("crowd_state", "normal"), infra=self._infra)
+
         return {
             "id":        str(uuid.uuid4())[:8],
             "timestamp": time.strftime("%H:%M:%S"),
@@ -497,6 +557,7 @@ class Platform:
             "density":   meta["density"],
             "count":     meta["count"],
             "acked":     False,
+            "sop":       prescription,
         }
 
 

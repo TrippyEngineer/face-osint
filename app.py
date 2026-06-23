@@ -1033,6 +1033,25 @@ def cic_stream():
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+@app.route("/crowd/api/alert/<aid>/ack", methods=["POST"])
+def cic_ack_alert(aid):
+    """Operator acknowledges an alert/SOP — stops its escalation timer."""
+    ok = get_platform().acknowledge_alert(aid)
+    return jsonify(ok=ok)
+
+@app.route("/crowd/api/infra", methods=["GET"])
+def cic_infra():
+    return jsonify(elements=get_platform().get_infrastructure())
+
+@app.route("/crowd/api/infra/<eid>", methods=["POST"])
+def cic_set_infra(eid):
+    """Open/close/restrict a gate, bridge, or exit (operator control)."""
+    d  = request.get_json() or {}
+    ok = get_platform().set_infra_state(eid, d.get("state", ""))
+    if not ok:
+        return jsonify(error="Unknown element or invalid state (open|restricted|closed)"), 400
+    return jsonify(ok=True, id=eid, state=d.get("state"))
+
 @app.route("/crowd/api/slot/<int:slot>/start", methods=["POST"])
 def cic_start_slot(slot):
     if slot < 0 or slot > 3:
@@ -2091,6 +2110,12 @@ body{
 .cic-alert-item.resolved{border-color:#22c55e;background:rgba(34,197,94,.10);opacity:.85}
 .cic-alert-zone{font-weight:700;color:var(--text-primary);white-space:nowrap}
 .cic-alert-msg{color:var(--text-secondary);flex:1}
+.cic-ack-btn{margin-left:auto;font-size:9px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border:1px solid var(--border);border-radius:4px;background:var(--bg-elevated);color:var(--text-secondary);cursor:pointer;flex-shrink:0}
+.cic-ack-btn:hover{border-color:var(--accent);color:var(--accent)}
+.cic-sop{margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.2)}
+.cic-sop-head{font-size:10px;font-weight:700;letter-spacing:.05em;color:var(--accent-hover);margin-bottom:3px}
+.cic-sop-conflict{color:var(--red);font-weight:600;font-size:11px;margin:2px 0}
+.cic-sop-actions{margin:2px 0 0 16px;padding:0;font-size:11px;color:var(--text-secondary);line-height:1.5}
 .cic-alert-ts{font-size:9px;color:var(--text-muted);white-space:nowrap}
 .cic-llm-panel{border-top:1px solid var(--border);padding:10px;display:flex;flex-direction:column;gap:6px;flex-shrink:0;background:var(--bg-card)}
 .cic-llm-title{font-size:11px;font-weight:700;color:var(--accent)}
@@ -4373,10 +4398,37 @@ function _cicAddAlert(a) {
 
   var div = document.createElement('div');
   div.className = 'cic-alert-item ' + (a.severity || 'warning');
-  div.innerHTML =
-    '<span class="cic-alert-ts">' + (a.timestamp || '') + '</span>' +
-    '<span class="cic-alert-zone">' + (a.zone || '') + '</span>' +
-    '<span class="cic-alert-msg">' + (a.message || '') + '</span>';
+  div.style.flexDirection = 'column';
+  div.style.alignItems = 'stretch';
+
+  var row =
+    '<div style="display:flex;align-items:flex-start;gap:8px;width:100%">' +
+      '<span class="cic-alert-ts">' + (a.timestamp || '') + '</span>' +
+      '<span class="cic-alert-zone">' + (a.zone || '') + '</span>' +
+      '<span class="cic-alert-msg">' + (a.message || '') + '</span>' +
+      (a.id && !a.acked ? '<button class="cic-ack-btn" data-aid="' + a.id + '" onclick="_cicAckAlert(this)">ACK</button>' : '') +
+    '</div>';
+
+  var sopHtml = '';
+  if (a.sop) {
+    var acts = (a.sop.actions || []).map(function(ac) {
+      var tgt = (ac.targets || []).map(function(t) {
+        return esc(t.name) + (t.state && t.state !== 'open' ? ' [' + esc(t.state) + ']' : '');
+      }).join(', ');
+      return '<li>' + esc(ac.instruction || '') +
+             (tgt ? ' <span style="color:var(--text-muted)">&rarr; ' + tgt + '</span>' : '') + '</li>';
+    }).join('');
+    var conf = (a.sop.conflicts || []).map(function(c) {
+      return '<div class="cic-sop-conflict">&#9940; ' + esc(c.issue || '') + '</div>';
+    }).join('');
+    sopHtml =
+      '<div class="cic-sop">' +
+        '<div class="cic-sop-head">&#9635; ' + esc(a.sop.headline || a.sop.sop_id || 'SOP') + '</div>' +
+        conf +
+        (acts ? '<ol class="cic-sop-actions">' + acts + '</ol>' : '') +
+      '</div>';
+  }
+  div.innerHTML = row + sopHtml;
   log.insertBefore(div, log.firstChild);
   while (log.children.length > 60) log.removeChild(log.lastChild);
 
@@ -4386,6 +4438,19 @@ function _cicAddAlert(a) {
     alertsTab.style.animation = 'cic-blink 0.4s ease-in-out 3';
     setTimeout(function() { alertsTab.style.animation = ''; }, 1300);
   }
+}
+
+function _cicAckAlert(btn) {
+  var aid = btn.getAttribute('data-aid');
+  if (!aid) return;
+  btn.disabled = true;
+  fetch('/crowd/api/alert/' + encodeURIComponent(aid) + '/ack', {method: 'POST'})
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      if (j.ok) { btn.textContent = 'ACKED'; btn.style.opacity = 0.5; }
+      else { btn.disabled = false; }
+    })
+    .catch(function() { btn.disabled = false; });
 }
 
 // ── Leaflet GIS Map ────────────────────────────────────────────────────────

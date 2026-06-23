@@ -191,6 +191,9 @@ CIC_COMPRESSION_DENSITY    = float(os.getenv("CIC_COMPRESSION_DENSITY", "5.0")) 
 CIC_CRITICAL_DENSITY       = float(os.getenv("CIC_CRITICAL_DENSITY", "8.0"))      # ppl/m² — crush regime (critical)
 CIC_TURBULENCE_CV          = float(os.getenv("CIC_TURBULENCE_CV", "0.75"))        # velocity coeff-of-variation → stop-and-go/turbulence
 
+# ── SOP playbook engine (crowd/sop.py) ──────────────────────────────────────
+CIC_SOP_ESCALATE_S         = int(os.getenv("CIC_SOP_ESCALATE_S", "120"))  # unacked high/critical SOP escalates after this
+
 
 # ── CIC Phase 4: persistence / retention ────────────────────────────────────
 CIC_READING_PERSIST_S = 10     # min seconds between persisted zone-reading snapshots

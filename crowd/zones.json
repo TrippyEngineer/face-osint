@@ -18,7 +18,12 @@
       "capacity": 16000,
       "camera_slot": 0,
       "thresholds": {"caution": 1.5, "high": 3.0, "critical": 6.0},
-      "color": "#6366f1"
+      "color": "#6366f1",
+      "infrastructure": [
+        {"id": "gate_a1", "name": "Ghat Entry Gate", "kind": "gate", "state": "open"},
+        {"id": "exit_a1", "name": "Ghat East Exit", "kind": "exit", "state": "open"},
+        {"id": "exit_a2", "name": "Ghat West Exit", "kind": "exit", "state": "open"}
+      ]
     },
     {
       "id": "zone_b",
@@ -33,7 +38,12 @@
       "capacity": 4000,
       "camera_slot": 1,
       "thresholds": {"caution": 2.0, "high": 4.5, "critical": 7.0},
-      "color": "#06b6d4"
+      "color": "#06b6d4",
+      "infrastructure": [
+        {"id": "bridge_b1", "name": "Main Pontoon Bridge", "kind": "bridge", "state": "open"},
+        {"id": "gate_b1", "name": "Bridge North Gate", "kind": "gate", "state": "open"},
+        {"id": "exit_b1", "name": "Bridge South Exit", "kind": "exit", "state": "open"}
+      ]
     },
     {
       "id": "zone_c",
@@ -48,7 +58,12 @@
       "capacity": 20000,
       "camera_slot": 2,
       "thresholds": {"caution": 1.0, "high": 2.5, "critical": 5.0},
-      "color": "#8b5cf6"
+      "color": "#8b5cf6",
+      "infrastructure": [
+        {"id": "gate_c1", "name": "Plaza Main Gate", "kind": "gate", "state": "open"},
+        {"id": "gate_c2", "name": "Plaza Side Gate", "kind": "gate", "state": "open"},
+        {"id": "exit_c1", "name": "Plaza North Exit", "kind": "exit", "state": "open"}
+      ]
     },
     {
       "id": "zone_d",
@@ -63,7 +78,11 @@
       "capacity": 8000,
       "camera_slot": 3,
       "thresholds": {"caution": 1.2, "high": 2.8, "critical": 5.5},
-      "color": "#f59e0b"
+      "color": "#f59e0b",
+      "infrastructure": [
+        {"id": "gate_d1", "name": "Road Checkpoint", "kind": "gate", "state": "open"},
+        {"id": "exit_d1", "name": "Road Diversion Exit", "kind": "exit", "state": "open"}
+      ]
     }
   ]
 }
