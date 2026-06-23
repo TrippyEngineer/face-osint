@@ -3529,6 +3529,7 @@ function buildResults(m,name){
           `<div class="id-name">${esc(id.resolved_name||name)}</div>` +
           `<div class="id-badges">` +
             `<span class="vb ${vc}">${esc(vLabel.toUpperCase())}</span>` +
+            (id.corroborated===false && v!=='no_results' ? `<span style="font-size:10px;color:var(--yellow);border:1px solid rgba(245,158,11,.35);border-radius:4px;padding:1px 5px" title="Face matched but the name was not corroborated — treat the hits below as reverse-image leads, not a confirmed identity">name not corroborated</span>` : '') +
             (allMatches.length ? `<span style="font-size:10px;color:var(--text-muted)">${allMatches.length} results</span>` : '') +
             ((id.sources||[]).length ? `<span style="font-size:10px;color:var(--text-muted)">${id.sources.length} sources</span>` : '') +
           `</div>` +
@@ -3559,6 +3560,11 @@ function buildResults(m,name){
     // ── Match cards ───────────────────────────────────────────
     (allMatches.length ? `<div class="res-section-title">All Matches (${allMatches.length})</div>` +
       `<div class="mc-grid">${allMatches.slice(0,50).map((mm,i)=>_matchCard(mm,i)).join('')}</div>` : '') +
+    // ── Reverse-image leads (uncorroborated face hits) ────────
+    ((id.face_leads||[]).length ? `<div class="res-section-title" title="Pages where this face/photo appears. The name is NOT verified as the subject — treat as leads, not identity.">Reverse-Image Leads &mdash; where this face appears (identity not confirmed)</div>` +
+      `<div class="plinks">${(id.face_leads||[]).slice(0,20).map(ld =>
+        `<a class="plink result-link" href="${esc(ld.url||'#')}" target="_blank" rel="noopener noreferrer" onclick="_markVisited(this)">${_platIcon(ld.url||'')} ${esc(ld.name_on_page||'(no name on page)')} &middot; face ${Math.round((ld.face_score||0)*100)}%</a>`
+      ).join('')}</div>` : '') +
     // ── Report path ───────────────────────────────────────────
     (m.folder ? `<div class="it" style="margin-top:12px"><div class="lbl">Report saved to</div>` +
     `<div class="val" style="font-size:10px;color:var(--text-muted)">${esc(m.folder)}</div></div>` : '');

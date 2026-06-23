@@ -8,6 +8,7 @@ import tempfile
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from typing import Optional
 
 import cv2
@@ -22,6 +23,28 @@ logger = logging.getLogger(__name__)
 FACE_POSSIBLE  = getattr(config, "FACE_POSSIBLE",  0.50)
 MAX_CANDIDATES = 25   # 25 × ~1s/face ≈ 20s verify; keeps total under 90s timeout
 VERIFY_WORKERS = 6
+
+# Engine-cached thumbnail hosts. These serve a copy of the QUERY image the engine
+# matched, so face-verifying the query against them is self-referential (~0.94 for
+# anything) AND showing them returns the user's own image. We verify/display the
+# candidate page's OWN photo instead.
+_ENGINE_THUMB_HOSTS = (
+    "encrypted-tbn0.gstatic.com", "encrypted-tbn1.gstatic.com",
+    "encrypted-tbn2.gstatic.com", "encrypted-tbn3.gstatic.com",
+    "gstatic.com/images", "googleusercontent.com/gps-proxy",
+    "mm.bing.net/th", "bing.com/th", "tse1.mm.bing.net", "tse2.mm.bing.net",
+    "tse3.mm.bing.net", "tse4.mm.bing.net", "yandex.net/i?", "avatars.mds.yandex.net",
+)
+
+def _is_engine_thumbnail(u: str) -> bool:
+    u = (u or "").lower()
+    return any(h in u for h in _ENGINE_THUMB_HOSTS)
+
+def _name_sim(a: str, b: str) -> float:
+    a, b = (a or "").lower().strip(), (b or "").lower().strip()
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
 
 _SOCIAL = {
     "linkedin.com": "LinkedIn", "github.com": "GitHub", "gitlab.com": "GitLab",
@@ -153,9 +176,17 @@ def _serpapi_lens(public_url: Optional[str]) -> tuple[list[dict], list[str]]:
                         "source":    f"serpapi_lens_{search_type}",
                     })
 
-            # Knowledge graph / entity panel — Lens sometimes identifies the person directly
-            for kg in (data.get("knowledge_graph") or []):
-                nm  = kg.get("title", "")
+            # Knowledge graph / entity panel — Lens sometimes identifies the person
+            # directly. SerpApi returns this as a DICT for Lens (a list for some
+            # engines); iterating a dict as a list yielded keys/raised and was
+            # swallowed, which is why entity names never extracted. Handle both.
+            kg_data  = data.get("knowledge_graph")
+            kg_items = (kg_data if isinstance(kg_data, list)
+                        else [kg_data] if isinstance(kg_data, dict) else [])
+            for kg in kg_items:
+                if not isinstance(kg, dict):
+                    continue
+                nm  = kg.get("title", "") or kg.get("name", "")
                 url = kg.get("link", "")
                 if nm and len(nm.split()) >= 2:
                     names.append(nm)
@@ -442,30 +473,49 @@ def _search_pimeyes(image_b64: str) -> list:
 # ══════════════════════════════════════════════════════════════════════════
 #  FACE VERIFICATION (DeepFace inline)
 # ══════════════════════════════════════════════════════════════════════════
-def _fetch_image(url: str, photo_url: Optional[str] = None) -> Optional[bytes]:
-    for try_url in filter(None, [photo_url, url]):
-        try:
-            r = requests.get(try_url, headers=config.BROWSER_HEADERS,
-                             timeout=8, allow_redirects=True)
-            if not r.ok:
-                continue
-            ct = r.headers.get("content-type", "")
-            if "image/" in ct:
-                return r.content
-            if "html" in ct:
-                soup = BeautifulSoup(r.text, "html.parser")
-                for meta in soup.find_all("meta"):
-                    prop = meta.get("property", "") or meta.get("name", "")
-                    if prop in ("og:image", "twitter:image"):
-                        img_url = meta.get("content", "")
-                        if img_url and img_url.startswith("http"):
-                            r2 = requests.get(img_url, headers=config.BROWSER_HEADERS,
-                                              timeout=6)
-                            if r2.ok and "image/" in r2.headers.get("content-type", ""):
-                                return r2.content
-        except Exception:
-            pass
-    return None
+def _http_image(try_url: str) -> tuple[Optional[bytes], Optional[str]]:
+    """Fetch raw image bytes from a direct image URL or a page's og:image.
+    Returns (bytes, actual_image_url) or (None, None)."""
+    try:
+        r = requests.get(try_url, headers=config.BROWSER_HEADERS,
+                         timeout=8, allow_redirects=True)
+        if not r.ok:
+            return None, None
+        ct = r.headers.get("content-type", "")
+        if "image/" in ct:
+            return r.content, try_url
+        if "html" in ct:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for meta in soup.find_all("meta"):
+                prop = meta.get("property", "") or meta.get("name", "")
+                if prop in ("og:image", "twitter:image"):
+                    img_url = meta.get("content", "")
+                    if img_url and img_url.startswith("http"):
+                        r2 = requests.get(img_url, headers=config.BROWSER_HEADERS, timeout=6)
+                        if r2.ok and "image/" in r2.headers.get("content-type", ""):
+                            return r2.content, img_url
+    except Exception:
+        pass
+    return None, None
+
+
+def _fetch_image(url: str, photo_url: Optional[str] = None
+                 ) -> tuple[Optional[bytes], Optional[str], bool]:
+    """Fetch the candidate's REAL photo for face-verify, preferring the page's own
+    image over an engine-cached thumbnail (a copy of the QUERY → self-referential
+    ~0.94 match). Returns (bytes, image_url, used_thumbnail)."""
+    thumb      = photo_url if (photo_url and _is_engine_thumbnail(photo_url)) else None
+    real_photo = photo_url if (photo_url and not _is_engine_thumbnail(photo_url)) else None
+    # Prefer a real direct photo_url → the page (og:image) → (last resort) the thumb.
+    for try_url in filter(None, [real_photo, url]):
+        data, img_url = _http_image(try_url)
+        if data:
+            return data, img_url, False
+    if thumb:
+        data, img_url = _http_image(thumb)
+        if data:
+            return data, img_url, True
+    return None, None, False
 
 
 def _verify_one(query_np: np.ndarray, cand: dict) -> dict:
@@ -473,9 +523,17 @@ def _verify_one(query_np: np.ndarray, cand: dict) -> dict:
     cand.setdefault("face_score", None)
     cand.setdefault("face_similarity", 0.0)
 
-    img_bytes = _fetch_image(cand.get("url", ""), cand.get("photo_url"))
-    if not img_bytes:
-        cand["_no_image"] = True
+    img_bytes, img_url, used_thumb = _fetch_image(cand.get("url", ""), cand.get("photo_url"))
+    if used_thumb or not img_bytes:
+        # Only the engine's cached thumbnail of the QUERY was reachable (or no image
+        # at all). Verifying the query against its own cached copy is self-referential
+        # (~0.94 for anything), so record NO face score and drop the thumbnail so the
+        # UI never shows the user's own query image back as a "match".
+        if used_thumb:
+            cand["face_evidence"] = "thumbnail_only"
+            cand["photo_url"]     = None
+        else:
+            cand["_no_image"] = True
         return cand
     try:
         buf        = np.frombuffer(img_bytes, dtype=np.uint8)
@@ -492,7 +550,10 @@ def _verify_one(query_np: np.ndarray, cand: dict) -> dict:
         cand["face_similarity"] = sim
         cand["face_score"]      = sim
         cand["face_verified"]   = sim >= FACE_POSSIBLE
+        cand["face_evidence"]   = "page_photo"
         cand["no_face_photo"]   = False
+        if img_url:
+            cand["photo_url"] = img_url   # show the page's real photo, not the cached thumb
     except Exception as e:
         logger.debug(f"verify {cand.get('url','')[:60]}: {e}")
     return cand
@@ -897,10 +958,15 @@ def scrape(context: dict) -> dict:
     confirmed   = [c for c in verified if c.get("face_verified")]
     unconfirmed = [c for c in verified if not c.get("face_verified")]
 
-    # Collect names from confirmed results
+    # Collect names from confirmed results — but only adopt a page-title name when
+    # it CORROBORATES the query name. Without this gate a look-alike's page title
+    # (e.g. "PUJYA GHOSH" for query "Neeraj Jain") became the identity and drove a
+    # wrong CSE name-expansion. With no query name, don't invent one from a title.
     for c in confirmed:
         t = (c.get("title", "") or "").split(" - ")[0].split(" | ")[0].strip()
-        if t and 2 <= len(t.split()) <= 5 and t not in detected_names:
+        if not (t and 2 <= len(t.split()) <= 5) or t in detected_names:
+            continue
+        if name_hint and _name_sim(name_hint, t) >= 0.6:
             detected_names.append(t)
     if not detected_names and name_hint:
         detected_names = [name_hint]

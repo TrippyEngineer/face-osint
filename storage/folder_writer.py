@@ -160,7 +160,14 @@ class FolderWriter:
             f"  SOURCES HIT:     {', '.join(sources) if sources else 'none'}",
         ]
 
-        # Resolved identity summary
+        corrob = identity.get("corroborated")
+        if corrob is not None:
+            lines.append(
+                "  CORROBORATED:    " + ("yes (face + name agree)" if corrob
+                else "NO — face match is not name-corroborated; see leads below")
+            )
+
+        # Resolved identity summary (populated only for a corroborated identity)
         if identity.get("resolved_name") and identity["resolved_name"] != name:
             lines.append(f"  RESOLVED AS:     {identity['resolved_name']}")
         if identity.get("email"):
@@ -174,6 +181,23 @@ class FolderWriter:
             for url in identity["profile_urls"][:8]:
                 lines.append(f"    • {url}")
         lines.append("")
+
+        # ── Reverse-image leads (uncorroborated face hits) ────────────────
+        # "Where this face appears" — pages that visually match the photo but
+        # whose name is NOT verified as the subject. Kept distinct from the
+        # resolved identity so a look-alike is never read as the person.
+        leads = identity.get("face_leads") or []
+        if leads:
+            title = "REVERSE-IMAGE LEADS (face appears here — NOT confirmed identity)"
+            lines.append(f"─── {title} ───")
+            for ld in leads[:12]:
+                nm = ld.get("name_on_page") or "(no name on page)"
+                fs = ld.get("face_score")
+                fs_s = f"{fs:.2f}" if isinstance(fs, (int, float)) else "?"
+                lines.append(f"  • [face {fs_s}] {nm}")
+                if ld.get("url"):
+                    lines.append(f"      {ld['url']}")
+            lines.append("")
 
         # ── Per-source sections ───────────────────────────────────────────
         section_map = {
