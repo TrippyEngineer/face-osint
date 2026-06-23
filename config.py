@@ -181,6 +181,16 @@ CIC_LOITER_FRAMES      = 40     # frames stationary before "loitering" (~8s @5fp
 CIC_RUNNING_SPEED      = 18.0   # px/frame velocity to flag "running"
 CIC_FACE_MIN_CROP_PX   = 70     # skip Khoya-Paya capture for crops smaller than this
 
+# ── Crowd-PRESSURE early-warning (crowd/pressure.py) ────────────────────────
+# Density bands (persons/m²): a density threshold alone is NOT stampede prediction
+# (the 2025 Sangam crush fired its alarm too late). Helbing pressure = density ×
+# velocity-variance + turbulence escalate the risk EARLIER. Calibrate per camera.
+CIC_PRESSURE_ENABLED       = True
+CIC_DENSE_DENSITY          = 2.0    # ppl/m² — comfortable-but-crowded
+CIC_COMPRESSION_DENSITY    = 5.0    # ppl/m² — body compression begins (risky)
+CIC_CRITICAL_DENSITY       = 8.0    # ppl/m² — crush regime (critical)
+CIC_TURBULENCE_CV          = 0.75   # velocity coeff-of-variation → stop-and-go/turbulence
+
 
 # ── CIC Phase 4: persistence / retention ────────────────────────────────────
 CIC_READING_PERSIST_S = 10     # min seconds between persisted zone-reading snapshots

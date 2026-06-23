@@ -361,6 +361,22 @@ class CameraAnalyzer:
         thresh  = self.zone_cfg.get("thresholds", {"caution": 1.5, "high": 3.0, "critical": 6.0})
         risk    = self._risk_level(density, thresh)
 
+        # Crowd-PRESSURE early-warning: a density threshold alone is not stampede
+        # prediction. Helbing pressure (density × velocity-variance) + turbulence
+        # escalate the risk earlier. Velocities are already tracked per person.
+        pa = {}
+        if getattr(config, "CIC_PRESSURE_ENABLED", True):
+            from crowd import pressure as _pressure
+            velocities = [d.get("velocity", 0.0) for d in detections if d.get("id", -1) >= 0]
+            pa = _pressure.assess(
+                density, velocities,
+                dense_density=getattr(config, "CIC_DENSE_DENSITY", 2.0),
+                compression_density=getattr(config, "CIC_COMPRESSION_DENSITY", 5.0),
+                critical_density=getattr(config, "CIC_CRITICAL_DENSITY", 8.0),
+                turbulence_cv=getattr(config, "CIC_TURBULENCE_CV", 0.75),
+            )
+            risk = _pressure.escalate_risk(risk, pa["crowd_state"])
+
         # Suspicious persons count
         n_suspicious = sum(1 for d in detections if d.get("suspicious"))
         n_running    = sum(1 for d in detections if d.get("running"))
@@ -381,6 +397,12 @@ class CameraAnalyzer:
             "n_running":     n_running,
             "n_loitering":   n_loitering,
             "n_children":    n_children,
+            # Crowd-pressure early-warning fields (crowd/pressure.py)
+            "pressure":      pa.get("pressure", 0.0),
+            "pressure_cv":   pa.get("pressure_cv", 0.0),
+            "los":           pa.get("los", "A"),
+            "crowd_state":   pa.get("crowd_state", "normal"),
+            "turbulence":    pa.get("turbulence", False),
             # Person coordinates for heat map (normalized 0-1)
             "heatmap_pts": [
                 [round(cx / w, 3), round(cy / h, 3)]

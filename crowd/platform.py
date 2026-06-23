@@ -105,6 +105,10 @@ class Platform:
             "density":  0.0,
             "risk":     "safe",
             "flow":     {"dx": 0.0, "dy": 0.0, "speed": 0.0},
+            "pressure":    0.0,
+            "crowd_state": "normal",
+            "los":         "A",
+            "turbulence":  False,
             "history":  deque([0] * HISTORY_LEN, maxlen=HISTORY_LEN),
             "capacity": z.get("capacity", 10000),
             "area_m2":  z.get("area_m2", 5000),
@@ -344,6 +348,10 @@ class Platform:
                 zs["n_suspicious"] = meta.get("n_suspicious", 0)
                 zs["n_running"]    = meta.get("n_running", 0)
                 zs["n_children"]   = meta.get("n_children", 0)
+                zs["pressure"]     = meta.get("pressure", 0.0)
+                zs["crowd_state"]  = meta.get("crowd_state", "normal")
+                zs["los"]          = meta.get("los", "A")
+                zs["turbulence"]   = meta.get("turbulence", False)
                 zs["history"].append(meta["count"])
 
                 # Alert on risk escalation
@@ -420,6 +428,10 @@ class Platform:
                 "n_suspicious": zs.get("n_suspicious", 0),
                 "n_running":   zs.get("n_running", 0),
                 "n_children":  zs.get("n_children", 0),
+                "pressure":    zs.get("pressure", 0.0),
+                "crowd_state": zs.get("crowd_state", "normal"),
+                "los":         zs.get("los", "A"),
+                "turbulence":  zs.get("turbulence", False),
             } for zid, zs in self._zone_states.items()},
             total_count=state_snap["total_count"],
             alerts=new_alerts,

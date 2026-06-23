@@ -4153,11 +4153,17 @@ function _cicHandleUpdate(d) {
     var bhvEl = document.getElementById('cic-bhv-' + slot);
     if (bhvEl) {
       var parts = [];
+      // Crowd-pressure early-warning (stampede precursor) leads the footer
+      if (z.turbulence) parts.push('⚠ TURBULENT');
+      if (z.crowd_state && z.crowd_state !== 'normal')
+        parts.push(String(z.crowd_state).toUpperCase() + (z.los ? ' · LoS ' + z.los : ''));
       if (z.n_suspicious > 0) parts.push('! ' + z.n_suspicious + ' susp');
       if (z.n_running    > 0) parts.push(z.n_running + ' run');
       if (z.n_children   > 0) parts.push(z.n_children + ' child');
       bhvEl.textContent = parts.join(' | ');
-      bhvEl.style.color = z.n_suspicious > 0 ? '#f97316' : 'var(--text-muted)';
+      bhvEl.style.color = (z.turbulence || z.crowd_state === 'critical') ? 'var(--red)'
+                        : (z.crowd_state === 'risky' || z.n_suspicious > 0) ? '#f97316'
+                        : 'var(--text-muted)';
     }
 
     // Leaflet zone polygon color
