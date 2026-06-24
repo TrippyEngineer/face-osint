@@ -180,6 +180,13 @@ CIC_CHILD_HEIGHT_RATIO = 0.22   # bbox height < ratio*frame height → "child"
 CIC_LOITER_FRAMES      = 40     # frames stationary before "loitering" (~8s @5fps)
 CIC_RUNNING_SPEED      = 18.0   # px/frame velocity to flag "running"
 CIC_FACE_MIN_CROP_PX   = 70     # skip Khoya-Paya capture for crops smaller than this
+# CIC face-capture quality controls (Khoya-Paya index). The crowd-camera path
+# stores low-fidelity head crops; enforcing a real face detection keeps the
+# index clean so a sharp selfie can actually match. These affect ONLY the CIC
+# capture path — NOT the OSINT face pipeline or the global FACE_* thresholds.
+CIC_FACE_ENFORCE       = os.getenv("CIC_FACE_ENFORCE", "1") not in ("0", "false", "False")  # require a detectable face before indexing a crop
+CIC_FACE_DETECTOR      = os.getenv("CIC_FACE_DETECTOR", "")    # "" → use DEEPFACE_DETECTOR; else override only the CIC path (e.g. "retinaface", "yunet")
+CIC_FACE_DIAG          = os.getenv("CIC_FACE_DIAG", "0") not in ("0", "false", "False")      # TEMP diagnostic: log real-face vs fallback per stored crop
 
 # ── Crowd-PRESSURE early-warning (crowd/pressure.py) ────────────────────────
 # Density bands (persons/m²): a density threshold alone is NOT stampede prediction
@@ -219,6 +226,7 @@ CIC_NOTIFY_WORKERS       = int(os.getenv("CIC_NOTIFY_WORKERS", "3"))      # boun
 CIC_CLIPS_ENABLED = os.getenv("CIC_CLIPS_ENABLED", "1") not in ("0", "false", "False")
 CIC_CLIP_PRE_S    = int(os.getenv("CIC_CLIP_PRE_S", "10"))
 CIC_CLIP_POST_S   = int(os.getenv("CIC_CLIP_POST_S", "10"))
+CIC_CLIP_MANUAL_MAX_S = int(os.getenv("CIC_CLIP_MANUAL_MAX_S", "300"))  # cap on a manual start/stop recording's length
 CIC_INCIDENT_DIR  = OUTPUT_DIR / "cic_incidents"
 CIC_INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
 

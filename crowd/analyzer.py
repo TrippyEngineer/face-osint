@@ -63,6 +63,10 @@ class CameraAnalyzer:
         self._clip_fps   = INFERENCE_FPS
         self._clip_buf   = deque(maxlen=getattr(config, "CIC_CLIP_PRE_S", 10) * INFERENCE_FPS)
         self._recording  = False
+        # Operator-triggered manual recording (arbitrary length, start/stop)
+        self._manual_recording  = False
+        self._manual_frames: Optional[list] = None
+        self._manual_max_frames  = getattr(config, "CIC_CLIP_MANUAL_MAX_S", 300) * INFERENCE_FPS
         self._prev_gray:       Optional[np.ndarray] = None
         self._flow_counter     = 0
         self._frame_count      = 0
@@ -100,6 +104,15 @@ class CameraAnalyzer:
             logger.warning(f"Slot {self.slot_id}: cannot open source '{source}'")
             return False
 
+        # Keep only the freshest frame buffered (best-effort; some FFMPEG/RTSP
+        # backends ignore it, so _run also drains to the latest frame). Without
+        # this a 25-30 FPS live source read at 5 FPS drifts seconds behind real
+        # time and the heatmap/overlay visibly lag live state.
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
         with self._lock:
             self._gen   += 1
             my_gen       = self._gen
@@ -112,6 +125,8 @@ class CameraAnalyzer:
             self._prev_gray   = None
             self._person_hist = {}
             self._frame_count = 0
+            self._manual_recording = False
+            self._manual_frames    = None
 
         # Pre-warm YOLO in a separate daemon thread so frames flow immediately
         threading.Thread(target=self._load_model, daemon=True,
@@ -194,6 +209,55 @@ class CameraAnalyzer:
                          name=f"CIC-clip{self.slot_id}").start()
         return True
 
+    def snapshot(self):
+        """Return a copy of the latest annotated frame (BGR), or None if idle."""
+        with self._lock:
+            f = self._last_frame
+        return f.copy() if f is not None else None
+
+    def is_manual_recording(self) -> bool:
+        with self._lock:
+            return self._manual_recording
+
+    def start_manual_recording(self) -> bool:
+        """Begin an operator-triggered recording, seeded with the pre-buffer so
+        the moment just before the click is included. Returns False if the slot
+        is inactive or a recording is already running."""
+        with self._lock:
+            if not self._active or self._manual_recording:
+                return False
+            self._manual_frames    = list(self._clip_buf)
+            self._manual_recording = True
+        return True
+
+    def stop_manual_recording(self, on_done) -> bool:
+        """Stop the manual recording, encode the captured frames to an mp4 in a
+        background thread, then call on_done(path:str). Returns False if not
+        recording or nothing was captured."""
+        with self._lock:
+            if not self._manual_recording:
+                return False
+            self._manual_recording = False
+            frames = self._manual_frames or []
+            self._manual_frames = None
+        if not frames:
+            return False
+
+        def _worker():
+            from crowd.clip import incident_clip_path, write_clip
+            path = incident_clip_path(getattr(config, "CIC_INCIDENT_DIR"),
+                                      self.zone_cfg.get("id", f"zone_{self.slot_id}"))
+            ok = write_clip(list(frames), path, self._clip_fps)
+            if ok:
+                try:
+                    on_done(str(path))
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True,
+                         name=f"CIC-mclip{self.slot_id}").start()
+        return True
+
     # ── Background thread ─────────────────────────────────────────────────
 
     def _stop_locked(self):
@@ -209,6 +273,8 @@ class CameraAnalyzer:
         self._prev_gray      = None
         self._person_hist    = {}
         self._frame_count    = 0
+        self._manual_recording = False
+        self._manual_frames    = None
 
     def _run(self, cap, my_gen):
         interval = 1.0 / INFERENCE_FPS
@@ -222,6 +288,25 @@ class CameraAnalyzer:
 
                 t0  = time.time()
                 ret, frame = cap.read()
+
+                # Live sources buffer frames FIFO; consuming at 5 FPS while the
+                # camera pushes 25-30 FPS makes cap.read() return progressively
+                # staler frames, so the heatmap/overlay drift seconds behind real
+                # time. Drain the already-buffered backlog to the newest frame.
+                # Buffered grabs return near-instantly; the loop stops once a
+                # grab has to wait on a fresh frame (budget exceeded), so it
+                # costs at most ~one extra frame-time per cycle. Files are left
+                # to play linearly.
+                if ret and not is_file:
+                    _dt = time.time()
+                    while time.time() - _dt < 0.015:
+                        if not cap.grab():
+                            break
+                        ok2, f2 = cap.retrieve()
+                        if ok2 and f2 is not None:
+                            frame = f2
+                        else:
+                            break
 
                 if not ret or frame is None:
                     if is_file:
@@ -246,6 +331,18 @@ class CameraAnalyzer:
                     self._clip_buf.append(frame.copy())
                 except Exception:
                     pass
+
+                # Manual recording: keep appending the raw frame until the
+                # operator stops, or until the length cap is hit (then stop
+                # growing but keep what's captured so Stop still saves it).
+                if self._manual_recording:
+                    with self._lock:
+                        if (self._manual_recording and self._manual_frames is not None
+                                and len(self._manual_frames) < self._manual_max_frames):
+                            try:
+                                self._manual_frames.append(frame.copy())
+                            except Exception:
+                                pass
 
                 try:
                     meta, annotated = self._analyze(frame)
@@ -648,6 +745,13 @@ class CameraAnalyzer:
         db = Database()
         zone_id   = self.zone_cfg.get("id",   f"zone_{self.slot_id}")
         zone_name = self.zone_cfg.get("name", f"Zone {self.slot_id}")
+        # CIC-path-only capture quality controls (config CIC_FACE_*). enforce=True
+        # drops crops with no detectable face so the Khoya index stays clean (a
+        # sharp selfie can then actually match). These do NOT affect the OSINT
+        # face pipeline, which calls extract() with no overrides.
+        _enforce  = True if getattr(config, "CIC_FACE_ENFORCE", True) else None
+        _detector = getattr(config, "CIC_FACE_DETECTOR", "") or None
+        _diag     = getattr(config, "CIC_FACE_DIAG", False)
 
         while self._face_capture_q:
             try:
@@ -666,8 +770,30 @@ class CameraAnalyzer:
                         (max(160, int(w_c * scale)), max(160, int(h_c * scale))),
                         interpolation=cv2.INTER_LANCZOS4,
                     )
-                result = emb_mod.extract(crop)
-                if result and result.get("embedding") is not None:
+                # TEMP diagnostic (CIC_FACE_DIAG): does a STRICT detector find a
+                # real face in this crop? Reveals how many stored embeddings are
+                # genuine faces vs whole-crop fallbacks. Logged only; remove the
+                # flag once the quality question is settled.
+                if _diag:
+                    try:
+                        from deepface import DeepFace
+                        DeepFace.represent(
+                            img_path=crop, model_name=config.DEEPFACE_MODEL,
+                            detector_backend=config.DEEPFACE_DETECTOR,
+                            enforce_detection=True, align=True)
+                        _strict = "FACE"
+                    except Exception:
+                        _strict = "NOFACE"
+
+                result = emb_mod.extract(crop, enforce=_enforce, detector=_detector)
+                _stored = bool(result and result.get("embedding") is not None)
+                if _diag:
+                    logger.info(
+                        f"[FACEDIAG] slot{self.slot_id} track#{tid} "
+                        f"crop={tuple(crop.shape[:2])} strict={_strict} "
+                        f"stored={'Y' if _stored else 'N'} "
+                        f"conf={(result or {}).get('confidence')}")
+                if _stored:
                     import numpy as np
                     vec = np.array(result["embedding"], dtype=np.float32)
                     db.store_cic_capture(tid, self.slot_id, zone_id, zone_name, vec)

@@ -36,12 +36,19 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"]      = "3"
 os.environ["TF_ENABLE_DEPRECATION_WARNINGS"] = "0"
 
 
-def extract(frame: np.ndarray) -> Optional[dict]:
+def extract(frame: np.ndarray,
+            enforce: Optional[bool] = None,
+            detector: Optional[str] = None) -> Optional[dict]:
     """
     Detect the largest face in *frame* and return its Facenet512 embedding.
 
     Args:
         frame: BGR uint8 numpy array (from OpenCV)
+        enforce:  override enforce_detection (None → config.DEEPFACE_ENFORCE).
+                  Pass True to REQUIRE a detectable face (drops non-face crops).
+        detector: override detector backend (None → config.DEEPFACE_DETECTOR).
+                  Both overrides scope to this call only — the OSINT pipeline,
+                  which passes neither, is unaffected.
 
     Returns dict with:
         embedding   — 512D float32 L2-normalised numpy array
@@ -57,8 +64,8 @@ def extract(frame: np.ndarray) -> Optional[dict]:
         results = DeepFace.represent(
             img_path        = frame,
             model_name      = config.DEEPFACE_MODEL,
-            detector_backend= config.DEEPFACE_DETECTOR,
-            enforce_detection = config.DEEPFACE_ENFORCE,
+            detector_backend= detector or config.DEEPFACE_DETECTOR,
+            enforce_detection = config.DEEPFACE_ENFORCE if enforce is None else enforce,
             align           = True,
         )
 

@@ -196,6 +196,103 @@ class Platform:
                 for sid, a in self._analyzers.items()
             ]
 
+    # ── Manual incident capture (operator-triggered) ──────────────────────
+    # Manual captures are stored as lightweight cic_alerts rows (type=manual_*,
+    # severity=info, acked) so they appear in the Alerts & SOP clip list. They
+    # are NOT broadcast to the live alert feed and do not affect auto-alerting.
+
+    def _make_manual_alert(self, slot_id: int, kind: str,
+                           reason: str, clip_path=None) -> dict:
+        zone_cfg = self._zone_for_slot(slot_id)
+        labels   = {"snapshot": "Manual snapshot", "clip": "Manual incident clip",
+                    "recording": "Manual recording"}
+        return {
+            "id":        str(uuid.uuid4())[:8],
+            "timestamp": time.strftime("%H:%M:%S"),
+            "zone_id":   zone_cfg.get("id",   f"zone_{slot_id}"),
+            "zone":      zone_cfg.get("name", f"Zone {slot_id}"),
+            "type":      "manual_" + kind,
+            "severity":  "info",
+            "message":   (reason or "").strip() or labels.get(kind, "Manual capture"),
+            "density":   0.0,
+            "count":     0,
+            "clip_path": clip_path,
+            "acked":     True,
+        }
+
+    def capture_snapshot(self, slot_id: int, reason: str = "") -> Optional[str]:
+        """Save a still image of the slot's current frame as a manual incident.
+        Returns the alert uid, or None if the slot has no frame."""
+        import cv2
+        from crowd.clip import incident_snapshot_path
+        with self._lock:
+            a = self._analyzers.get(slot_id)
+        if a is None:
+            return None
+        frame = a.snapshot()
+        if frame is None:
+            return None
+        zone_cfg = self._zone_for_slot(slot_id)
+        path = incident_snapshot_path(getattr(config, "CIC_INCIDENT_DIR"),
+                                      zone_cfg.get("id", f"zone_{slot_id}"))
+        try:
+            cv2.imwrite(str(path), frame)
+        except Exception as e:
+            logger.warning(f"snapshot write failed: {e}")
+            return None
+        alert = self._make_manual_alert(slot_id, "snapshot", reason, clip_path=str(path))
+        try:
+            self._db.insert_cic_alert(alert)
+        except Exception as e:
+            logger.warning(f"persist snapshot alert failed: {e}")
+        return alert["id"]
+
+    def record_manual_clip(self, slot_id: int, reason: str = "") -> bool:
+        """Record a buffered (pre+post)s incident clip on demand, reusing the
+        auto-incident machinery. False if the slot is inactive, clips are
+        disabled, or a clip is already in flight."""
+        with self._lock:
+            a = self._analyzers.get(slot_id)
+        if a is None:
+            return False
+        alert = self._make_manual_alert(slot_id, "clip", reason)
+        ok = a.record_incident(
+            lambda p, u=alert["id"]: self._db.update_cic_alert_clip(u, p))
+        if not ok:
+            return False
+        try:
+            self._db.insert_cic_alert(alert)
+        except Exception as e:
+            logger.warning(f"persist manual clip alert failed: {e}")
+        return True
+
+    def start_manual_recording(self, slot_id: int) -> bool:
+        with self._lock:
+            a = self._analyzers.get(slot_id)
+        return bool(a and a.start_manual_recording())
+
+    def stop_manual_recording(self, slot_id: int, reason: str = "") -> bool:
+        with self._lock:
+            a = self._analyzers.get(slot_id)
+        if a is None or not a.is_manual_recording():
+            return False
+        alert = self._make_manual_alert(slot_id, "recording", reason)
+        # Insert the alert row BEFORE handing the callback to the encoder
+        # worker. Unlike record_incident (which sleeps a post-roll first), this
+        # worker encodes immediately, so its update_cic_alert_clip() could
+        # otherwise race ahead of the INSERT, match 0 rows, and lose the clip.
+        try:
+            self._db.insert_cic_alert(alert)
+        except Exception as e:
+            logger.warning(f"persist manual recording alert failed: {e}")
+        return bool(a.stop_manual_recording(
+            lambda p, u=alert["id"]: self._db.update_cic_alert_clip(u, p)))
+
+    def is_manual_recording(self, slot_id: int) -> bool:
+        with self._lock:
+            a = self._analyzers.get(slot_id)
+        return bool(a and a.is_manual_recording())
+
     # ── State access ──────────────────────────────────────────────────────
 
     def get_state(self) -> dict:

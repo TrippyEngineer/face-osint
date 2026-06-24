@@ -999,16 +999,20 @@ def cic_alerts_history():
 
 @app.route("/crowd/api/incident_clip/<path:filename>")
 def cic_incident_clip(filename):
-    """Serve a recorded incident clip from CIC_INCIDENT_DIR (basename only — no path traversal)."""
+    """Serve a recorded incident clip or snapshot from CIC_INCIDENT_DIR
+    (basename only — no path traversal)."""
     from werkzeug.utils import secure_filename
     from flask import send_file
-    safe = secure_filename(filename)
-    if not safe.endswith(".mp4"):
-        return jsonify(error="Not a clip"), 400
+    safe  = secure_filename(filename)
+    ext   = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+    mimes = {"mp4": "video/mp4", "jpg": "image/jpeg",
+             "jpeg": "image/jpeg", "png": "image/png"}
+    if ext not in mimes:
+        return jsonify(error="Unsupported media"), 400
     path = config.CIC_INCIDENT_DIR / safe
     if not path.exists():
         return jsonify(error="Clip not found"), 404
-    return send_file(str(path), mimetype="video/mp4")
+    return send_file(str(path), mimetype=mimes[ext])
 
 @app.route("/crowd/api/zones/history")
 def cic_zones_history():
@@ -1122,21 +1126,41 @@ def cic_slot_toggle(slot):
     get_platform().set_toggle(slot, name, value)
     return jsonify(ok=True)
 
-@app.route("/crowd/api/ask", methods=["POST"])
-def cic_ask():
-    from crowd.llm_ops import ask as llm_ask
-    d        = request.get_json() or {}
-    question = (d.get("question") or "").strip()
-    if not question:
-        return jsonify(error="question required"), 400
-    api_key  = config.ANTHROPIC_API_KEY
-    state    = get_platform().get_state()
-    def gen():
-        for chunk in llm_ask(question, state, api_key):
-            yield f"data:{json.dumps({'text': chunk})}\n\n"
-        yield 'data:{"done":true}\n\n'
-    return Response(gen(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+# ── CIC manual incident capture (snapshot / buffered clip / start-stop record) ─
+@app.route("/crowd/api/slot/<int:slot>/capture", methods=["POST"])
+def cic_slot_capture(slot):
+    """mode=snapshot → still image; mode=clip → buffered ~(pre+post)s clip."""
+    d      = request.get_json(silent=True) or {}
+    mode   = (d.get("mode") or "clip").strip()
+    reason = (d.get("reason") or "").strip()
+    plat   = get_platform()
+    if mode == "snapshot":
+        uid = plat.capture_snapshot(slot, reason)
+        if not uid:
+            return jsonify(ok=False, error="No frame — is the slot active?"), 400
+        return jsonify(ok=True, mode="snapshot", id=uid)
+    ok = plat.record_manual_clip(slot, reason)
+    if not ok:
+        return jsonify(ok=False,
+                       error="Slot inactive, clips disabled, or a clip is already recording"), 400
+    return jsonify(ok=True, mode="clip")
+
+@app.route("/crowd/api/slot/<int:slot>/record", methods=["POST"])
+def cic_slot_record(slot):
+    """action=start → begin an open-ended recording; action=stop → finalize it."""
+    d      = request.get_json(silent=True) or {}
+    action = (d.get("action") or "").strip()
+    reason = (d.get("reason") or "").strip()
+    plat   = get_platform()
+    if action == "start":
+        if not plat.start_manual_recording(slot):
+            return jsonify(ok=False, error="Slot inactive or already recording"), 400
+        return jsonify(ok=True, recording=True)
+    if action == "stop":
+        if not plat.stop_manual_recording(slot, reason):
+            return jsonify(ok=False, error="Not recording or nothing captured"), 400
+        return jsonify(ok=True, recording=False)
+    return jsonify(ok=False, error="action must be start|stop"), 400
 
 # ── CIC Assistant: persisted multi-turn chats ───────────────────────────────
 @app.route("/crowd/api/chats", methods=["GET"])
@@ -2120,12 +2144,6 @@ body{
 .cic-infra-chip:hover{filter:brightness(1.25)}
 .cic-infra-chip:disabled{opacity:.5;cursor:default}
 .cic-alert-ts{font-size:9px;color:var(--text-muted);white-space:nowrap}
-.cic-llm-panel{border-top:1px solid var(--border);padding:10px;display:flex;flex-direction:column;gap:6px;flex-shrink:0;background:var(--bg-card)}
-.cic-llm-title{font-size:11px;font-weight:700;color:var(--accent)}
-.cic-llm-response{background:var(--bg-base);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;color:var(--text-primary);min-height:55px;max-height:130px;overflow-y:auto;white-space:pre-wrap;line-height:1.5}
-.cic-llm-input-row{display:flex;gap:6px}
-#cic-llm-q{flex:1;background:var(--bg-elevated);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:11px;color:var(--text-primary);outline:none}
-#cic-llm-q:focus{border-color:var(--accent)}
 .cic-analytics-layout{flex:1;display:flex;gap:10px;padding:10px;min-height:0}
 .cic-chart-card{flex:1;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;min-width:0}
 .cic-chart-title{font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:8px;flex-shrink:0}
@@ -2136,6 +2154,8 @@ body{
 .cic-khoya-sub{font-size:12px;color:var(--text-secondary);line-height:1.5}
 .cic-upload-zone{border:2px dashed var(--border-bright);border-radius:8px;padding:24px;text-align:center;color:var(--text-muted);font-size:12px;cursor:pointer;transition:border-color .15s;display:flex;flex-direction:column;align-items:center;gap:8px}
 .cic-upload-zone:hover{border-color:var(--accent);color:var(--text-secondary)}
+.cic-upload-zone.cic-dragover{border-color:var(--accent);background:var(--bg-card);color:var(--text-secondary)}
+.cic-btn-sm.rec-on{background:var(--red);color:#fff;border-color:var(--red);animation:cic-blink 1s ease-in-out infinite}
 .cic-khoya-results{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.7}
 .cic-toggle-bar{display:flex;align-items:center;gap:5px;padding:5px 10px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap}
 .cic-toggle-sep{flex:1}
@@ -2463,7 +2483,7 @@ body{
       <button class="cic-tog on" id="tog-show_count"      onclick="cicToggle('show_count')">Count</button>
       <span class="cic-toggle-sep"></span>
       <span style="font-size:10px;color:var(--text-muted)">ALARM:</span>
-      <button class="cic-tog" id="tog-audio" onclick="cicToggleAudio()">&#128266; Audio</button>
+      <button class="cic-tog on" id="tog-audio" onclick="cicToggleAudio()">&#128266; Audio</button>
     </div>
     <!-- 2x2 camera grid -->
     <div class="cic-cam-grid">
@@ -2478,6 +2498,9 @@ body{
             <button class="cic-btn-sm" onclick="cicStartSlot(0)">&#9654; Start</button>
             <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(0)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(0)">&#9632; Stop</button>
+            <button class="cic-btn-sm" title="Snapshot (still image)" onclick="cicSnapshot(0)">&#128247;</button>
+            <button class="cic-btn-sm" title="Save a ~20s incident clip" onclick="cicClip(0)">&#127916;</button>
+            <button class="cic-btn-sm" id="cic-rec-0" title="Start / stop recording" onclick="cicToggleRecord(0)">&#9210;</button>
           </div>
         </div>
         <img class="cic-cam-img" id="cic-frame-0" alt="" onclick="cicZoomSlot(0)" title="Click to enlarge"/>
@@ -2499,6 +2522,9 @@ body{
             <button class="cic-btn-sm" onclick="cicStartSlot(1)">&#9654; Start</button>
             <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(1)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(1)">&#9632; Stop</button>
+            <button class="cic-btn-sm" title="Snapshot (still image)" onclick="cicSnapshot(1)">&#128247;</button>
+            <button class="cic-btn-sm" title="Save a ~20s incident clip" onclick="cicClip(1)">&#127916;</button>
+            <button class="cic-btn-sm" id="cic-rec-1" title="Start / stop recording" onclick="cicToggleRecord(1)">&#9210;</button>
           </div>
         </div>
         <img class="cic-cam-img" id="cic-frame-1" alt="" onclick="cicZoomSlot(1)" title="Click to enlarge"/>
@@ -2520,6 +2546,9 @@ body{
             <button class="cic-btn-sm" onclick="cicStartSlot(2)">&#9654; Start</button>
             <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(2)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(2)">&#9632; Stop</button>
+            <button class="cic-btn-sm" title="Snapshot (still image)" onclick="cicSnapshot(2)">&#128247;</button>
+            <button class="cic-btn-sm" title="Save a ~20s incident clip" onclick="cicClip(2)">&#127916;</button>
+            <button class="cic-btn-sm" id="cic-rec-2" title="Start / stop recording" onclick="cicToggleRecord(2)">&#9210;</button>
           </div>
         </div>
         <img class="cic-cam-img" id="cic-frame-2" alt="" onclick="cicZoomSlot(2)" title="Click to enlarge"/>
@@ -2541,6 +2570,9 @@ body{
             <button class="cic-btn-sm" onclick="cicStartSlot(3)">&#9654; Start</button>
             <button class="cic-btn-sm" title="Upload a video file" onclick="cicUploadVideo(3)">&#128193; Video</button>
             <button class="cic-btn-sm" onclick="cicStopSlot(3)">&#9632; Stop</button>
+            <button class="cic-btn-sm" title="Snapshot (still image)" onclick="cicSnapshot(3)">&#128247;</button>
+            <button class="cic-btn-sm" title="Save a ~20s incident clip" onclick="cicClip(3)">&#127916;</button>
+            <button class="cic-btn-sm" id="cic-rec-3" title="Start / stop recording" onclick="cicToggleRecord(3)">&#9210;</button>
           </div>
         </div>
         <img class="cic-cam-img" id="cic-frame-3" alt="" onclick="cicZoomSlot(3)" title="Click to enlarge"/>
@@ -2578,14 +2610,6 @@ body{
       </div>
       <div class="cic-alert-log" id="cic-alert-log">
         <div style="color:var(--text-muted);font-size:12px;padding:12px">No alerts &mdash; monitoring active zones&hellip;</div>
-      </div>
-      <div class="cic-llm-panel">
-        <div class="cic-llm-title">&#9889; AI Operator Assistant (Claude)</div>
-        <div class="cic-llm-response" id="cic-llm-response" style="color:var(--text-muted)">Ask about current crowd conditions, which zones need attention, or SOP guidance&hellip;</div>
-        <div class="cic-llm-input-row">
-          <input id="cic-llm-q" type="text" placeholder="e.g. Which zones need immediate attention?" onkeydown="if(event.key==='Enter')cicAsk()"/>
-          <button class="cic-btn-sm" onclick="cicAsk()" style="padding:5px 14px;font-size:11px">Ask</button>
-        </div>
       </div>
     </div>
   </div>
@@ -2663,9 +2687,9 @@ body{
     <div class="cic-khoya-layout">
       <div class="cic-khoya-title">&#128269; Khoya-Paya &mdash; Lost Person Search</div>
       <div class="cic-khoya-sub">Upload a photo of the missing person. The system will search face embeddings collected from all active camera feeds and historical searches.</div>
-      <div class="cic-upload-zone" onclick="document.getElementById('cic-khoya-input').click()">
+      <div class="cic-upload-zone" id="cic-khoya-zone" onclick="document.getElementById('cic-khoya-input').click()">
         <img id="cic-khoya-preview" style="max-height:130px;max-width:200px;border-radius:6px;display:none" alt=""/>
-        <div>&#128247; Click to upload photo</div>
+        <div>&#128247; Click <b>or drag &amp; drop</b> a photo here</div>
         <div style="font-size:10px;color:var(--text-muted)">JPG, PNG, WEBP supported</div>
       </div>
       <input type="file" id="cic-khoya-input" accept="image/*" style="display:none" onchange="cicKhoyaFile(this)"/>
@@ -3833,7 +3857,8 @@ var _cicToggleState = {     // mirrors server toggle state
   show_bbox: true, show_track_id: true, show_suspicious: true,
   show_children: true, show_flow: true, show_count: true
 };
-var _cicAudioOn    = false;
+var _cicAudioOn    = true;  // alarm audible by default (toggle with the 🔊 button)
+var _cicAudioCtx   = null;  // single shared WebAudio context (autoplay-unlocked)
 var _cicLastCritical = 0;   // timestamp of last audio alarm
 
 var _RISK_FILL = {safe:'#22c55e', caution:'#f59e0b', high:'#f97316', critical:'#ef4444'};
@@ -3901,11 +3926,21 @@ function _cicLoadClips() {
     var el = document.getElementById('cic-clip-list');
     if(!el) return;
     var clips = (d.alerts||[]).filter(function(a){return a.clip_path;});
-    if(!clips.length){ el.innerHTML='<div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>'; return; }
-    el.innerHTML = '<div style="font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin-bottom:4px">&#128249; Incident Clips</div>' +
+    var head = '<div style="font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin-bottom:2px">&#128249; Incident Clips</div>' +
+               '<div style="font-size:9px;color:var(--text-muted);margin-bottom:5px">Auto-captured on high/critical alerts, or captured manually from a camera tile. Each entry shows why it was captured.</div>';
+    if(!clips.length){ el.innerHTML = head + '<div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>'; return; }
+    el.innerHTML = head +
       clips.map(function(a){
         var f = String(a.clip_path||'').replace(/\\/g,'/').split('/').pop();
-        return '<div style="font-size:11px;padding:3px 0"><a href="/crowd/api/incident_clip/'+encodeURIComponent(f)+'" target="_blank" rel="noopener" class="result-link">&#128249; '+esc(a.zone_name||a.zone||'zone')+' &middot; '+esc(String(a.severity||'').toUpperCase())+' &middot; '+esc(a.created_at||'')+'</a></div>';
+        var isImg  = /\.(jpg|jpeg|png)$/i.test(f);
+        var manual = String(a.type||'').indexOf('manual') === 0;
+        var tag    = manual ? 'MANUAL' : String(a.severity||'').toUpperCase();
+        var reason = a.message || '';
+        return '<div style="font-size:11px;padding:4px 0;border-bottom:1px solid var(--border)">' +
+                 '<a href="/crowd/api/incident_clip/'+encodeURIComponent(f)+'" target="_blank" rel="noopener" class="result-link">' +
+                   (isImg?'&#128247;':'&#128249;')+' '+esc(a.zone_name||a.zone||'zone')+' &middot; '+esc(tag)+' &middot; '+esc(a.created_at||'')+'</a>' +
+                 (reason ? '<div style="color:var(--text-muted);font-size:10px;margin-top:1px">&#8627; '+esc(reason)+'</div>' : '') +
+               '</div>';
       }).join('');
   }).catch(function(){});
 }
@@ -4229,10 +4264,47 @@ function cicToggle(name) {
   });
 }
 
+// Lazily create + resume the single shared AudioContext. Browsers (Chrome/Edge)
+// start it 'suspended' until a user gesture; the alarm fires from an SSE
+// callback (not a gesture), so without resuming, the first critical beep is
+// silently swallowed. The unlock listener below + cicToggleAudio resume it.
+function _cicGetAudioCtx() {
+  try {
+    if (!_cicAudioCtx) _cicAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_cicAudioCtx.state === 'suspended') _cicAudioCtx.resume();
+  } catch (e) { return null; }
+  return _cicAudioCtx;
+}
+// One-time: unlock WebAudio on the first real user gesture anywhere on the page.
+(function() {
+  function _unlock() {
+    _cicGetAudioCtx();
+    document.removeEventListener('pointerdown', _unlock);
+    document.removeEventListener('keydown', _unlock);
+  }
+  document.addEventListener('pointerdown', _unlock);
+  document.addEventListener('keydown', _unlock);
+})();
+
+function _cicBeep(vol) {
+  var ctx = _cicGetAudioCtx();
+  if (!ctx) return;
+  try {
+    var osc = ctx.createOscillator(), gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = 880; osc.type = 'sine';
+    gain.gain.setValueAtTime(vol || 0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.2);
+  } catch (e) {}
+}
+
 function cicToggleAudio() {
   _cicAudioOn = !_cicAudioOn;
   var btn = document.getElementById('tog-audio');
   if (btn) btn.classList.toggle('on', _cicAudioOn);
+  // Toggling on is a user gesture → unlock + confirm with a short beep.
+  if (_cicAudioOn) _cicBeep(0.12);
 }
 
 function _cicPlayAlarm() {
@@ -4240,8 +4312,9 @@ function _cicPlayAlarm() {
   var now = Date.now();
   if (now - _cicLastCritical < 30000) return;  // 30s cooldown
   _cicLastCritical = now;
+  var ctx = _cicGetAudioCtx();
+  if (!ctx) return;
   try {
-    var ctx = new (window.AudioContext || window.webkitAudioContext)();
     [880, 1100, 880].forEach(function(freq, i) {
       var osc  = ctx.createOscillator();
       var gain = ctx.createGain();
@@ -4289,6 +4362,7 @@ function _cicUploadAndStart(slot, file) {
     try { d = JSON.parse(xhr.responseText); } catch(e) { d = {}; }
     if (d.ok) {
       _cicActiveSlots.add(slot);
+      _cicResetRecBtn(slot);   // a fresh analyzer replaced any in-flight recording
       var tile = document.getElementById('cic-tile-' + slot);
       var dot  = document.getElementById('cic-dot-' + slot);
       if (tile) tile.classList.remove('offline');
@@ -4367,6 +4441,7 @@ function _cicDoStart(slot, src) {
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (d.ok) {
       _cicActiveSlots.add(slot);
+      _cicResetRecBtn(slot);   // a fresh analyzer replaced any in-flight recording
       var tile = document.getElementById('cic-tile-' + slot);
       var dot  = document.getElementById('cic-dot-' + slot);
       if (tile) tile.classList.remove('offline');
@@ -4395,6 +4470,54 @@ function cicStopSlot(slot) {
   if (dot)   { dot.className = 'cic-status-dot offline'; }
   if (risk)  { risk.textContent = 'OFFLINE'; risk.className = 'cic-risk-safe'; }
   if (badge) { badge.textContent = '--'; }
+  // Recording can't continue on a stopped slot — reset its button.
+  _cicResetRecBtn(slot);
+}
+
+// ── Manual incident capture (snapshot / buffered clip / start-stop record) ──
+function _cicCapFetch(url, body) {
+  return fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                     body: JSON.stringify(body || {})}).then(function(r) { return r.json(); });
+}
+function _cicToast(msg, kind) { if (typeof toast === 'function') toast(msg, kind); }
+function _cicResetRecBtn(slot) {
+  var rec = document.getElementById('cic-rec-' + slot);
+  if (rec) { rec.classList.remove('rec-on'); rec.innerHTML = '&#9210;'; rec.title = 'Start / stop recording'; }
+}
+function cicSnapshot(slot) {
+  if (!_cicActiveSlots.has(slot)) { _cicToast('Start slot ' + slot + ' first', 'er'); return; }
+  _cicCapFetch('/crowd/api/slot/' + slot + '/capture', {mode: 'snapshot'}).then(function(d) {
+    if (d.ok) { _cicToast('Snapshot saved (slot ' + slot + ')', 'ok'); _cicLoadClips(); }
+    else _cicToast('Snapshot failed: ' + (d.error || ''), 'er');
+  }).catch(function() { _cicToast('Snapshot error', 'er'); });
+}
+function cicClip(slot) {
+  if (!_cicActiveSlots.has(slot)) { _cicToast('Start slot ' + slot + ' first', 'er'); return; }
+  _cicToast('Recording ~20s incident clip (slot ' + slot + ')…', 'ok');
+  _cicCapFetch('/crowd/api/slot/' + slot + '/capture', {mode: 'clip'}).then(function(d) {
+    if (d.ok) { setTimeout(_cicLoadClips, 12000); }   // wait out the ~10s post-roll
+    else _cicToast('Clip failed: ' + (d.error || ''), 'er');
+  }).catch(function() { _cicToast('Clip error', 'er'); });
+}
+function cicToggleRecord(slot) {
+  var btn = document.getElementById('cic-rec-' + slot);
+  var recording = btn && btn.classList.contains('rec-on');
+  if (!recording) {
+    if (!_cicActiveSlots.has(slot)) { _cicToast('Start slot ' + slot + ' first', 'er'); return; }
+    _cicCapFetch('/crowd/api/slot/' + slot + '/record', {action: 'start'}).then(function(d) {
+      if (d.ok) {
+        if (btn) { btn.classList.add('rec-on'); btn.innerHTML = '&#9209;'; btn.title = 'Stop recording'; }
+        _cicToast('Recording slot ' + slot + '…', 'ok');
+      } else _cicToast('Record failed: ' + (d.error || ''), 'er');
+    }).catch(function() { _cicToast('Record error', 'er'); });
+  } else {
+    var reason = (typeof prompt === 'function') ? (prompt('Note for this recording (optional):') || '') : '';
+    _cicCapFetch('/crowd/api/slot/' + slot + '/record', {action: 'stop', reason: reason}).then(function(d) {
+      if (btn) { btn.classList.remove('rec-on'); btn.innerHTML = '&#9210;'; btn.title = 'Start / stop recording'; }
+      if (d.ok) { _cicToast('Recording saved (slot ' + slot + ')', 'ok'); setTimeout(_cicLoadClips, 1500); }
+      else _cicToast('Stop failed: ' + (d.error || ''), 'er');
+    }).catch(function() { _cicToast('Record error', 'er'); });
+  }
 }
 
 // ── Alert log ──────────────────────────────────────────────────────────────
@@ -4558,7 +4681,7 @@ function cicToggleHeatmap() {
     if (st) st.textContent = '';
   } else {
     _cicUpdateHeatmap();
-    _cicHeatTimer = setInterval(_cicUpdateHeatmap, 2000);
+    _cicHeatTimer = setInterval(_cicUpdateHeatmap, 1000);
   }
 }
 
@@ -4602,7 +4725,7 @@ function cicRefreshMap() {
   _cicHeatLayer = null; // stale reference from old map instance
   if (_cicMapObj) { _cicMapObj.remove(); _cicMapObj = null; _cicZonePolys = {}; }
   _cicInitMap();
-  if (_cicHeatOn) { _cicUpdateHeatmap(); _cicHeatTimer = setInterval(_cicUpdateHeatmap, 2000); }
+  if (_cicHeatOn) { _cicUpdateHeatmap(); _cicHeatTimer = setInterval(_cicUpdateHeatmap, 1000); }
 }
 
 // ── Chart.js Analytics ─────────────────────────────────────────────────────
@@ -4691,55 +4814,18 @@ function _cicLiveUpdateCharts(zones) {
   _cicDenChart.update('none');
 }
 
-// ── LLM Operator Assistant ─────────────────────────────────────────────────
-function cicAsk() {
-  var qEl  = document.getElementById('cic-llm-q');
-  var resp = document.getElementById('cic-llm-response');
-  if (!qEl || !resp) return;
-  var q = qEl.value.trim();
-  if (!q) return;
-
-  resp.textContent = 'Thinking…';
-  resp.style.color = 'var(--text-muted)';
-
-  fetch('/crowd/api/ask', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({question: q})
-  }).then(function(r) {
-    var reader  = r.body.getReader();
-    var decoder = new TextDecoder();
-    var text    = '';
-    resp.textContent = '';
-    resp.style.color = 'var(--text-primary)';
-
-    function pump() {
-      reader.read().then(function(res) {
-        if (res.done) return;
-        var raw = decoder.decode(res.value, {stream: true});
-        raw.split('\n').forEach(function(line) {
-          if (line.startsWith('data:')) {
-            try {
-              var msg = JSON.parse(line.slice(5));
-              if (msg.done) return;
-              if (msg.text) { text += msg.text; resp.textContent = text; resp.scrollTop = resp.scrollHeight; }
-            } catch (ex) {}
-          }
-        });
-        pump();
-      }).catch(function() {});
-    }
-    pump();
-  }).catch(function(e) {
-    resp.textContent = 'Error: ' + e.message;
-    resp.style.color = 'var(--red)';
-  });
-}
-
 // ── Khoya-Paya (Lost Person Search) ───────────────────────────────────────
 function cicKhoyaFile(input) {
-  var file = input.files[0];
+  if (input.files && input.files[0]) cicKhoyaProcess(input.files[0]);
+}
+
+function cicKhoyaProcess(file) {
   if (!file) return;
+  var res0 = document.getElementById('cic-khoya-results');
+  if (file.type && !/^image\//.test(file.type)) {
+    if (res0) { res0.style.display = 'block'; res0.innerHTML = '<span style="color:var(--red)">Please use an image file (JPG, PNG, WEBP).</span>'; }
+    return;
+  }
   var reader = new FileReader();
   reader.onload = function(e) {
     var b64 = e.target.result;
@@ -4758,7 +4844,7 @@ function cicKhoyaFile(input) {
         res.innerHTML =
           '<div style="color:var(--yellow);font-weight:600;margin-bottom:6px">&#9888; No face detected</div>' +
           'Upload a clear, well-lit frontal photo. Avoid sunglasses or head coverings.<br>' +
-          '<small style="color:var(--text-muted)">Faces indexed from cameras: ' + (d.cic_faces_indexed||0) + '</small>';
+          '<small style="color:var(--text-muted)">Camera face captures (lifetime total, all cameras): ' + (d.cic_faces_indexed||0) + '</small>';
         return;
       }
       if (d.error) {
@@ -4783,23 +4869,46 @@ function cicKhoyaFile(input) {
           }
           html += '</div>';
         });
-        html += '<small style="color:var(--text-muted)">Faces indexed from cameras: ' + (d.cic_faces_indexed||0) + '</small>';
+        html += '<small style="color:var(--text-muted)">Camera face captures (lifetime total, all cameras): ' + (d.cic_faces_indexed||0) + '</small>';
         res.innerHTML = html;
       } else {
         var indexed = d.cic_faces_indexed || 0;
         res.innerHTML =
           '<div style="color:var(--yellow);font-weight:600;margin-bottom:6px">No match found</div>' +
-          'This person was not found in the face database.<br><br>' +
-          '<b>Faces indexed from cameras: ' + indexed + '</b><br>' +
+          'No camera capture closely matched this face.<br><br>' +
+          '<small style="color:var(--text-muted)">Camera face captures (lifetime total, all cameras): <b>' + indexed + '</b> — a running total, not a sign this person was captured.</small><br>' +
           (indexed === 0
-            ? '<small style="color:var(--text-muted)">Start a camera slot and wait ~60s for faces to be captured automatically.</small>'
-            : '<small style="color:var(--text-muted)">Try a clearer frontal photo, or the person may not have been captured yet.</small>');
+            ? '<small style="color:var(--text-muted)">Start a camera slot and let it run — a face is indexed only once a clear, front-facing face is seen.</small>'
+            : '<small style="color:var(--text-muted)">Faces are indexed only when a clear, front-facing face is visible on camera. Have the person pass a camera face-on, or try a sharper frontal photo here.</small>');
       }
     }).catch(function(e) {
       if (res) res.textContent = 'Error: ' + e.message;
     });
   };
   reader.readAsDataURL(file);
+}
+
+// Drag & drop a photo onto the Khoya upload zone (click-to-pick still works).
+function _cicSetupKhoyaDrop() {
+  var zone = document.getElementById('cic-khoya-zone');
+  if (!zone) return;
+  ['dragenter', 'dragover'].forEach(function(ev) {
+    zone.addEventListener(ev, function(e) {
+      e.preventDefault(); e.stopPropagation();
+      zone.classList.add('cic-dragover');
+    });
+  });
+  ['dragleave', 'dragend'].forEach(function(ev) {
+    zone.addEventListener(ev, function(e) {
+      if (!zone.contains(e.relatedTarget)) zone.classList.remove('cic-dragover');
+    });
+  });
+  zone.addEventListener('drop', function(e) {
+    e.preventDefault(); e.stopPropagation();
+    zone.classList.remove('cic-dragover');
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) cicKhoyaProcess(f);
+  });
 }
 
 // Load Leaflet + Chart.js CDN lazily when CIC first opens
@@ -4830,6 +4939,7 @@ toggleCIC = function() {
 
 loadHistory();
 _cicSetupDragDrop();
+_cicSetupKhoyaDrop();
 </script>
 </body>
 </html>"""
