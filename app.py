@@ -646,7 +646,26 @@ def _cleanup_session(sid: str):
 # ══════════════════════════════════════════════════════════════════════════
 @app.route("/")
 def index():
-    return _HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    # no-store: the whole UI is one inline document, so a stale cached copy can
+    # mask server-side fixes (e.g. the audio/alarm handlers). Always serve fresh.
+    return _HTML, 200, {"Content-Type": "text/html; charset=utf-8",
+                        "Cache-Control": "no-store, max-age=0"}
+
+@app.route("/vendor/<path:filename>")
+def vendor_static(filename):
+    """Serve self-hosted vendor JS (Chart.js, leaflet-heat) so CIC analytics and
+    the heatmap don't depend on a CDN that may be blocked on the deployment LAN."""
+    from flask import send_file
+    from werkzeug.utils import secure_filename
+    safe    = secure_filename(filename)
+    allowed = {"chart.umd.min.js": "application/javascript",
+               "leaflet-heat.js":  "application/javascript"}
+    if safe not in allowed:
+        return jsonify(error="Not found"), 404
+    path = Path(app.root_path) / "vendor" / safe
+    if not path.exists():
+        return jsonify(error="Not found"), 404
+    return send_file(str(path), mimetype=allowed[safe])
 
 @app.route("/api/check_face", methods=["POST"])
 def api_check_face():
@@ -1005,14 +1024,20 @@ def cic_incident_clip(filename):
     from flask import send_file
     safe  = secure_filename(filename)
     ext   = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
-    mimes = {"mp4": "video/mp4", "jpg": "image/jpeg",
+    mimes = {"mp4": "video/mp4", "webm": "video/webm", "jpg": "image/jpeg",
              "jpeg": "image/jpeg", "png": "image/png"}
     if ext not in mimes:
         return jsonify(error="Unsupported media"), 400
     path = config.CIC_INCIDENT_DIR / safe
     if not path.exists():
         return jsonify(error="Clip not found"), 404
-    return send_file(str(path), mimetype=mimes[ext])
+    # Incident video uses the mp4v codec, which browsers can't decode inline
+    # (they only do H.264/VP9/AV1) — without this a clip opens as a blank player.
+    # H.264 is unavailable in this OpenCV build and VP8/VP9 CPU-encode too slowly,
+    # so serve video as a download (plays in any native player); images stay inline.
+    as_attach = ext in ("mp4", "webm")
+    return send_file(str(path), mimetype=mimes[ext],
+                     as_attachment=as_attach, download_name=safe)
 
 @app.route("/crowd/api/zones/history")
 def cic_zones_history():
@@ -2127,6 +2152,10 @@ body{
 #cic-map{flex:1;min-height:0}
 .cic-alerts-layout{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .cic-alert-log{flex:1;overflow-y:auto;padding:8px;min-height:0}
+.cic-alert-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;height:100%;min-height:220px;padding:24px;gap:5px}
+.cic-alert-empty-ic{font-size:38px;opacity:.45}
+.cic-alert-empty-t{font-size:14px;font-weight:700;color:var(--text-secondary);letter-spacing:.02em}
+.cic-alert-empty-s{font-size:11px;color:var(--text-muted);max-width:360px;line-height:1.5}
 .cic-alert-item{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;border-left:3px solid;font-size:11px}
 .cic-alert-item.warning{border-color:var(--yellow);background:var(--yellow-dim)}
 .cic-alert-item.high{border-color:#f97316;background:rgba(249,115,22,.1)}
@@ -2609,7 +2638,11 @@ body{
         <div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>
       </div>
       <div class="cic-alert-log" id="cic-alert-log">
-        <div style="color:var(--text-muted);font-size:12px;padding:12px">No alerts &mdash; monitoring active zones&hellip;</div>
+        <div id="cic-alert-empty" class="cic-alert-empty">
+          <div class="cic-alert-empty-ic">&#128737;</div>
+          <div class="cic-alert-empty-t">All clear</div>
+          <div class="cic-alert-empty-s">No active alerts. Live zones are being monitored &mdash; SOP guidance and prescribed actions appear here the moment density crosses a threshold.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -3916,7 +3949,7 @@ function cicTab(name) {
     setTimeout(_cicInitCharts, 50);
   }
   if (name === 'alerts') _cicLoadInfra();
-  if (name === 'alerts') { _cicLoadClips(); }
+  if (name === 'alerts') { _cicLoadClips(); _cicLoadActiveAlerts(); }
   if (name === 'assistant') { _asstInit(); }
 }
 
@@ -3927,7 +3960,7 @@ function _cicLoadClips() {
     if(!el) return;
     var clips = (d.alerts||[]).filter(function(a){return a.clip_path;});
     var head = '<div style="font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin-bottom:2px">&#128249; Incident Clips</div>' +
-               '<div style="font-size:9px;color:var(--text-muted);margin-bottom:5px">Auto-captured on high/critical alerts, or captured manually from a camera tile. Each entry shows why it was captured.</div>';
+               '<div style="font-size:9px;color:var(--text-muted);margin-bottom:5px">Auto-captured on high/critical alerts, or captured manually from a camera tile. Each entry shows why it was captured. Videos download to play in a media player; snapshots open inline.</div>';
     if(!clips.length){ el.innerHTML = head + '<div style="color:var(--text-muted);font-size:11px">No incident clips yet.</div>'; return; }
     el.innerHTML = head +
       clips.map(function(a){
@@ -4242,8 +4275,8 @@ function _cicHandleUpdate(d) {
   // New alerts + audio alarm
   if (d.alerts && d.alerts.length) {
     d.alerts.forEach(_cicAddAlert);
-    var hasCritical = d.alerts.some(function(a) { return a.severity === 'critical'; });
-    if (hasCritical) _cicPlayAlarm();
+    var hasUrgent = d.alerts.some(function(a) { return a.severity === 'critical' || a.severity === 'high'; });
+    if (hasUrgent) _cicPlayAlarm();
   }
 
   // Charts live update
@@ -4286,25 +4319,37 @@ function _cicGetAudioCtx() {
   document.addEventListener('keydown', _unlock);
 })();
 
-function _cicBeep(vol) {
-  var ctx = _cicGetAudioCtx();
-  if (!ctx) return;
-  try {
-    var osc = ctx.createOscillator(), gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
-    osc.frequency.value = 880; osc.type = 'sine';
-    gain.gain.setValueAtTime(vol || 0.15, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
-    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.2);
-  } catch (e) {}
+function _cicAlarmTones(ctx) {
+  // Three-tone square-wave alarm (~0.75s total).
+  [880, 1100, 880].forEach(function(freq, i) {
+    var osc  = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = freq;
+    osc.type = 'square';
+    gain.gain.setValueAtTime(0.3, ctx.currentTime + i * 0.25);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.25 + 0.2);
+    osc.start(ctx.currentTime + i * 0.25);
+    osc.stop(ctx.currentTime + i * 0.25 + 0.25);
+  });
 }
 
 function cicToggleAudio() {
   _cicAudioOn = !_cicAudioOn;
   var btn = document.getElementById('tog-audio');
   if (btn) btn.classList.toggle('on', _cicAudioOn);
-  // Toggling on is a user gesture → unlock + confirm with a short beep.
-  if (_cicAudioOn) _cicBeep(0.12);
+  // Toggling on is a real user gesture → unlock the WebAudio context AND play
+  // the actual alarm tone so the operator can verify audio works. The alarm
+  // itself only fires on a CRITICAL density alert, which a quiet scene never
+  // produces, so this toggle doubles as the alarm self-test.
+  if (_cicAudioOn) {
+    var ctx = _cicGetAudioCtx();
+    if (ctx) { try { _cicAlarmTones(ctx); } catch (e) {} }
+    _cicToast('Alarm audio ON — test tone played', 'ok');
+  } else {
+    _cicToast('Alarm audio muted', 'ok');
+  }
 }
 
 function _cicPlayAlarm() {
@@ -4314,20 +4359,7 @@ function _cicPlayAlarm() {
   _cicLastCritical = now;
   var ctx = _cicGetAudioCtx();
   if (!ctx) return;
-  try {
-    [880, 1100, 880].forEach(function(freq, i) {
-      var osc  = ctx.createOscillator();
-      var gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = freq;
-      osc.type = 'square';
-      gain.gain.setValueAtTime(0.3, ctx.currentTime + i * 0.25);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.25 + 0.2);
-      osc.start(ctx.currentTime + i * 0.25);
-      osc.stop(ctx.currentTime + i * 0.25 + 0.25);
-    });
-  } catch(e) {}
+  try { _cicAlarmTones(ctx); } catch (e) {}
 }
 
 // ── Slot management ────────────────────────────────────────────────────────
@@ -4521,15 +4553,30 @@ function cicToggleRecord(slot) {
 }
 
 // ── Alert log ──────────────────────────────────────────────────────────────
+// Load alerts already active on the server into the log (e.g. ones raised before
+// this browser connected, or after a tab switch / refresh). SSE only delivers
+// NEW alerts, so without this an active alert shows "All clear".
+function _cicLoadActiveAlerts() {
+  fetch('/crowd/api/status').then(function(r){return r.json();}).then(function(d){
+    var alerts = d.alerts || [];
+    if (!alerts.length) return;
+    // Render oldest-first so _cicAddAlert's prepend keeps newest on top.
+    alerts.slice().reverse().forEach(_cicAddAlert);
+  }).catch(function(){});
+}
+
 function _cicAddAlert(a) {
   var log = document.getElementById('cic-alert-log');
   if (!log) return;
-  // Remove placeholder
-  var placeholder = log.querySelector('div[style]');
-  if (placeholder && placeholder.textContent.includes('No alerts')) placeholder.remove();
+  // Dedupe: the same alert can arrive via both the active-list load and SSE.
+  if (a.id && log.querySelector('[data-alert-id="' + a.id + '"]')) return;
+  // Remove the empty-state placeholder, if present
+  var ph = document.getElementById('cic-alert-empty');
+  if (ph) ph.remove();
 
   var div = document.createElement('div');
   div.className = 'cic-alert-item ' + (a.severity || 'warning');
+  if (a.id) div.setAttribute('data-alert-id', a.id);
   div.style.flexDirection = 'column';
   div.style.alignItems = 'stretch';
 
@@ -4709,7 +4756,7 @@ function _cicUpdateHeatmap() {
       if (document.getElementById('leaflet-heat-js')) return; // already loading
       var s = document.createElement('script');
       s.id  = 'leaflet-heat-js';
-      s.src = 'https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js';
+      s.src = '/vendor/leaflet-heat.js';
       s.onload = _renderHeat;
       document.head.appendChild(s);
     } else {
@@ -4922,7 +4969,7 @@ function _cicSetupKhoyaDrop() {
   // Expose helper so toggleCIC can trigger load
   window._cicLoadLibs = function(cb) {
     loadScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', 'cic-leaflet-js', function() {
-      loadScript('https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js', 'cic-chartjs', cb);
+      loadScript('/vendor/chart.umd.min.js', 'cic-chartjs', cb);
     });
   };
 })();

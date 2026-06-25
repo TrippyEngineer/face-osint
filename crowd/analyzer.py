@@ -487,6 +487,12 @@ class CameraAnalyzer:
             )
             risk = _pressure.escalate_risk(risk, pa["crowd_state"])
 
+        # Count-based alert floor: escalate to the highest band the raw person
+        # count reaches, so the alert / SOP / alarm pipeline actually fires in
+        # normal and test scenes. The per-zone density thresholds target
+        # mega-crowd FOVs (hundreds of people) and are otherwise never crossed.
+        risk = self._escalate_by_count(risk, count)
+
         # Suspicious persons count
         n_suspicious = sum(1 for d in detections if d.get("suspicious"))
         n_running    = sum(1 for d in detections if d.get("running"))
@@ -590,6 +596,23 @@ class CameraAnalyzer:
         if density >= thresh.get("caution", 1.5):
             return "caution"
         return "safe"
+
+    @staticmethod
+    def _escalate_by_count(risk: str, count: int) -> str:
+        """Raise risk to the highest band the raw person count reaches
+        (config CIC_ALERT_COUNT_*); 0 disables a band. Never lowers risk."""
+        rank = {"safe": 0, "caution": 1, "high": 2, "critical": 3}
+        cc = getattr(config, "CIC_ALERT_COUNT_CAUTION", 0)
+        ch = getattr(config, "CIC_ALERT_COUNT_HIGH", 0)
+        cr = getattr(config, "CIC_ALERT_COUNT_CRITICAL", 0)
+        crisk = "safe"
+        if cr and count >= cr:
+            crisk = "critical"
+        elif ch and count >= ch:
+            crisk = "high"
+        elif cc and count >= cc:
+            crisk = "caution"
+        return risk if rank[risk] >= rank[crisk] else crisk
 
     # ── Overlay rendering ─────────────────────────────────────────────────
 
@@ -714,9 +737,15 @@ class CameraAnalyzer:
                 continue
             self._face_capture_ts[tid] = now
             x1, y1, x2, y2 = d["xyxy"]
-            # Crop the upper 50% of bbox (head region)
-            head_h = max(30, int((y2 - y1) * 0.5))
-            crop = frame[y1:y1 + head_h, x1:x2].copy()
+            # Crop the FULL person box (clamped to frame) and let the face
+            # detector locate + align the face inside it. The old upper-50%
+            # "head region" heuristic + opencv Haar frequently failed to find a
+            # real face (especially on webcam close-ups), so with enforce=True
+            # nothing got stored and the Khoya index stayed empty. A whole-person
+            # crop is detected far more reliably.
+            cx1, cy1 = max(0, x1), max(0, y1)
+            cx2, cy2 = min(w, x2), min(h, y2)
+            crop = frame[cy1:cy2, cx1:cx2].copy()
             if crop.size == 0:
                 continue
             if min(crop.shape[:2]) < getattr(config, "CIC_FACE_MIN_CROP_PX", 70):

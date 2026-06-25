@@ -573,6 +573,7 @@ class Platform:
         self._broadcast(
             type="update",
             zones={zid: {
+                "name":        zs["name"],   # needed by the analytics live-update
                 "count":       zs["count"],
                 "density":     zs["density"],
                 "risk":        zs["risk"],

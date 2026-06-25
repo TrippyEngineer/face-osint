@@ -158,6 +158,16 @@ CIC_DENSITY_CAUTION  = 1.5   # → yellow warning
 CIC_DENSITY_HIGH     = 3.0   # → orange high risk
 CIC_DENSITY_CRITICAL = 6.0   # → red critical / stampede alert
 
+# Count-based alert floor. The per-zone density thresholds target mega-crowd
+# camera FOVs (hundreds of people in frame); with a webcam or demo footage the
+# density never crosses them, so the alert / SOP / alarm pipeline never fires.
+# These trigger the same risk bands on RAW person count instead, so alerts are
+# reachable in normal/test scenes. Set any to 0 to disable that band; raise them
+# for a true high-density deployment.
+CIC_ALERT_COUNT_CAUTION  = int(os.getenv("CIC_ALERT_COUNT_CAUTION", "5"))
+CIC_ALERT_COUNT_HIGH     = int(os.getenv("CIC_ALERT_COUNT_HIGH", "12"))
+CIC_ALERT_COUNT_CRITICAL = int(os.getenv("CIC_ALERT_COUNT_CRITICAL", "25"))
+
 CIC_INFERENCE_FPS    = 5     # target FPS for YOLOv8n inference per slot
 CIC_MAX_SLOTS        = 4     # simultaneous camera slots
 
