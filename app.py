@@ -4969,7 +4969,11 @@ function _cicSetupKhoyaDrop() {
   // Expose helper so toggleCIC can trigger load
   window._cicLoadLibs = function(cb) {
     loadScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', 'cic-leaflet-js', function() {
-      loadScript('/vendor/chart.umd.min.js', 'cic-chartjs', cb);
+      // Eager-load leaflet-heat (self-hosted) so L.heatLayer is ready the instant
+      // the Heat Map toggle is clicked — no lazy-inject delay or first-toggle miss.
+      loadScript('/vendor/leaflet-heat.js', 'leaflet-heat-js', function() {
+        loadScript('/vendor/chart.umd.min.js', 'cic-chartjs', cb);
+      });
     });
   };
 })();
